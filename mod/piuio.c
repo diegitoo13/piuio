@@ -1,13 +1,13 @@
 /*
- * PIUIO interface driver
+ * PIUIO interface driver – unified legacy (vendor) + modern HID boards
  *
- * Copyright (C) 2012-2014 Devin J. Pohly (djpohly+linux@gmail.com)
+ * Copyright (C) 2012‑2014 Devin J. Pohly
+ * Copyright (C) 2025      Diego Acevedo <diego.acevedo.fernando@gmail.com>
  *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License as
- *	published by the Free Software Foundation, version 2.
- *
- * This code is based on the Linux USB HID keyboard driver by Vojtech Pavlik.
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, version 2.
+*
  */
 
 #include <linux/kernel.h>
@@ -20,626 +20,413 @@
 #include <linux/leds.h>
 #include <linux/wait.h>
 #include <linux/jiffies.h>
+#include <linux/timer.h>
 #include <linux/input.h>
 #include <linux/usb.h>
 #include <linux/usb/input.h>
 
+/*──────────────────── Common constants ───────────────────*/
+#define USB_VENDOR_ID_ANCHOR     0x0547
+#define USB_PRODUCT_ID_PYTHON2   0x1002
+#define USB_VENDOR_ID_BTNBOARD   0x0d2f
+#define USB_PRODUCT_ID_BTNBOARD  0x1010 /* modern boards share this */
 
-/*
- * Device and protocol definitions
- */
-#define USB_VENDOR_ID_ANCHOR 0x0547
-#define USB_PRODUCT_ID_PYTHON2 0x1002
-#define USB_VENDOR_ID_BTNBOARD 0x0d2f
-#define USB_PRODUCT_ID_BTNBOARD 0x1010
+/* Vendor‑specific request (legacy) */
+#define PIUIO_VND_REQ 0xae
+#define PIUIO_VND_VAL 0
+#define PIUIO_VND_IDX 0
+#define PIUIO_VND_SZ  8
 
-/* USB message used to communicate with the device */
-#define PIUIO_MSG_REQ 0xae
-#define PIUIO_MSG_VAL 0
-#define PIUIO_MSG_IDX 0
-
-#define PIUIO_MSG_SZ 8
-#define PIUIO_MSG_LONGS (PIUIO_MSG_SZ / sizeof(unsigned long))
+/* HID constants (modern) */
+#define PIUIO_HID_SET_IDLE     0x0a
+#define PIUIO_HID_GET_REPORT   0x01
+#define PIUIO_HID_SET_REPORT   0x09
+#define PIUIO_HID_RPT_INPUT    0x01      /* 258‑byte feature report */
+#define PIUIO_HID_RPT_OUT_BASE 0x80      /* 0x80…0x83 – 4× output banks */
+#define PIUIO_HID_INPUT_SIZE   258
+#define PIUIO_HID_OUTPUT_CHUNK 16
 
 /* Input keycode ranges */
-#define PIUIO_BTN_REG BTN_JOYSTICK
-#define PIUIO_NUM_REG (BTN_GAMEPAD - BTN_JOYSTICK)
-#define PIUIO_BTN_EXTRA BTN_TRIGGER_HAPPY
-#define PIUIO_NUM_EXTRA (KEY_MAX - BTN_TRIGGER_HAPPY)
-#define PIUIO_NUM_BTNS (PIUIO_NUM_REG + PIUIO_NUM_EXTRA)
+#define PIUIO_BTN_REG      BTN_JOYSTICK
+#define PIUIO_NUM_REG      (BTN_GAMEPAD - BTN_JOYSTICK)
+#define PIUIO_BTN_EXTRA    BTN_TRIGGER_HAPPY
+#define PIUIO_NUM_EXTRA    (KEY_MAX - BTN_TRIGGER_HAPPY)
+#define PIUIO_NUM_BTNS     (PIUIO_NUM_REG + PIUIO_NUM_EXTRA)
 
-
-/**
- * struct piuio_led - auxiliary struct for led devices
- * @piu:	Pointer back to the enclosing structure
- * @dev:	Actual led device
- */
-struct piuio_led {
-	struct piuio *piu;
-	struct led_classdev dev;
-};
-
-/**
- * struct piuio_devtype - parameters for different types of PIUIO devices
- * @led_names:	Array of LED names, of length @outputs, to use in sysfs
- * @inputs:	Number of input pins
- * @outputs:	Number of output pins
- * @mplex:	Number of sets of inputs
- * @mplex_bits:	Number of output bits reserved for multiplexing
- */
+/*──────────────────── Per‑board parameters ───────────────────*/
 struct piuio_devtype {
-	const char **led_names;
-	int inputs;
-	int outputs;
-	int mplex;
-	int mplex_bits;
+    const char **led_names;
+    int  inputs;
+    int  outputs;
+    int  mplex;      /* >1 on legacy boards */
+    int  mplex_bits; /* mux bit width          */
 };
 
-/**
- * struct piuio - state of each attached PIUIO
- * @type:	Type of PIUIO device (currently either full or buttonboard)
- * @idev:	Input device associated with this PIUIO
- * @phys:	Physical path of the device. @idev's phys field points to this
- *		buffer
- * @udev:	USB device associated with this PIUIO
- * @in:		URB for requesting the current state of one set of inputs
- * @out:	URB for sending data to outputs and multiplexer
- * @cr_in:	Setup packet for @in URB
- * @cr_out:	Setup packet for @out URB
- * @old_inputs:	Previous state of input pins from the @in URB for each of the
- *		input sets.  These are used to determine when a press or release
- *		has happened for a group of correlated inputs.
- * @inputs:	Buffer for the @in URB
- * @outputs:	Buffer for the @out URB
- * @new_outputs:
- * 		Staging for the @outputs buffer
- * @set:	Current set of inputs to read (0 .. @type->mplex - 1)
- */
-struct piuio {
-	struct piuio_devtype *type;
-
-	struct input_dev *idev;
-	char phys[64];
-
-	struct usb_device *udev;
-	struct urb *in, *out;
-	struct usb_ctrlrequest cr_in, cr_out;
-	wait_queue_head_t shutdown_wait;
-
-	unsigned long (*old_inputs)[PIUIO_MSG_LONGS];
-	unsigned long inputs[PIUIO_MSG_LONGS];
-	unsigned char outputs[PIUIO_MSG_SZ];
-	unsigned char new_outputs[PIUIO_MSG_SZ];
-
-	struct piuio_led *led;
-
-	int set;
+/* LED name tables (48 full, 8 button‑board) */
+static const char *led_names_full[] = {
+    "piuio::output0","piuio::output1","piuio::output2","piuio::output3",
+    "piuio::output4","piuio::output5","piuio::output6","piuio::output7",
+    "piuio::output8","piuio::output9","piuio::output10","piuio::output11",
+    "piuio::output12","piuio::output13","piuio::output14","piuio::output15",
+    "piuio::output16","piuio::output17","piuio::output18","piuio::output19",
+    "piuio::output20","piuio::output21","piuio::output22","piuio::output23",
+    "piuio::output24","piuio::output25","piuio::output26","piuio::output27",
+    "piuio::output28","piuio::output29","piuio::output30","piuio::output31",
+    "piuio::output32","piuio::output33","piuio::output34","piuio::output35",
+    "piuio::output36","piuio::output37","piuio::output38","piuio::output39",
+    "piuio::output40","piuio::output41","piuio::output42","piuio::output43",
+    "piuio::output44","piuio::output45","piuio::output46","piuio::output47"
+};
+static const char *led_names_bb[] = {
+    "piuio::bboutput0","piuio::bboutput1","piuio::bboutput2","piuio::bboutput3",
+    "piuio::bboutput4","piuio::bboutput5","piuio::bboutput6","piuio::bboutput7"
 };
 
-static const char *led_names[] = {
-	"piuio::output0",
-	"piuio::output1",
-	"piuio::output2",
-	"piuio::output3",
-	"piuio::output4",
-	"piuio::output5",
-	"piuio::output6",
-	"piuio::output7",
-	"piuio::output8",
-	"piuio::output9",
-	"piuio::output10",
-	"piuio::output11",
-	"piuio::output12",
-	"piuio::output13",
-	"piuio::output14",
-	"piuio::output15",
-	"piuio::output16",
-	"piuio::output17",
-	"piuio::output18",
-	"piuio::output19",
-	"piuio::output20",
-	"piuio::output21",
-	"piuio::output22",
-	"piuio::output23",
-	"piuio::output24",
-	"piuio::output25",
-	"piuio::output26",
-	"piuio::output27",
-	"piuio::output28",
-	"piuio::output29",
-	"piuio::output30",
-	"piuio::output31",
-	"piuio::output32",
-	"piuio::output33",
-	"piuio::output34",
-	"piuio::output35",
-	"piuio::output36",
-	"piuio::output37",
-	"piuio::output38",
-	"piuio::output39",
-	"piuio::output40",
-	"piuio::output41",
-	"piuio::output42",
-	"piuio::output43",
-	"piuio::output44",
-	"piuio::output45",
-	"piuio::output46",
-	"piuio::output47",
-};
-
-static const char *bbled_names[] = {
-	"piuio::bboutput0",
-	"piuio::bboutput1",
-	"piuio::bboutput2",
-	"piuio::bboutput3",
-	"piuio::bboutput4",
-	"piuio::bboutput5",
-	"piuio::bboutput6",
-	"piuio::bboutput7",
-};
-
-/* Full device parameters */
 static struct piuio_devtype piuio_dev_full = {
-	.led_names = led_names,
-	.inputs = (PIUIO_NUM_BTNS < 48) ? PIUIO_NUM_BTNS : 48,
-	.outputs = 48,
-	.mplex = 4,
-	.mplex_bits = 2,
+    .led_names  = led_names_full,
+    .inputs     = 48,
+    .outputs    = 48,
+    .mplex      = 4,
+    .mplex_bits = 2,
 };
-
-/* Button board device parameters */
 static struct piuio_devtype piuio_dev_bb = {
-	.led_names = bbled_names,
-	.inputs = (PIUIO_NUM_BTNS < 8) ? PIUIO_NUM_BTNS : 8,
-	.outputs = 8,
-	.mplex = 1,
-	.mplex_bits = 0,
+    .led_names  = led_names_bb,
+    .inputs     = 8,
+    .outputs    = 8,
+    .mplex      = 1,
+    .mplex_bits = 0,
+};
+static struct piuio_devtype piuio_dev_hid = {
+    .led_names  = led_names_full,
+    .inputs     = 48,
+    .outputs    = 48,
+    .mplex      = 1,
+    .mplex_bits = 0,
 };
 
+/*──────────────────── Main state ───────────────────*/
+struct piuio_led; /* fwd */
 
-/*
- * Auxiliary functions for reporting input events
- */
-static int keycode(unsigned int pin)
+enum piuio_proto { PROTO_VENDOR, PROTO_HID };
+
+struct piuio {
+    /* static */
+    struct piuio_devtype *type;
+    enum piuio_proto proto;
+
+    /* Linux framework */
+    struct usb_device *udev;
+    struct input_dev *idev;
+    char phys[64];
+
+    /* I/O buffers */
+    unsigned char  in_buf[PIUIO_HID_INPUT_SIZE];
+    unsigned char  out_buf[PIUIO_HID_OUTPUT_CHUNK];
+    unsigned char  led_shadow[48/8];
+
+    /* URBs (legacy) */
+    struct urb *urb_in;
+    struct urb *urb_out;
+    struct usb_ctrlrequest cr_in;
+    struct usb_ctrlrequest cr_out;
+
+    /* legacy multiplexer state */
+    int set;
+
+    /* input change tracking */
+    unsigned long prev_inputs[2];
+
+    /* LEDs */
+    struct piuio_led *led;
+
+    /* HID polling */
+    struct timer_list poll_timer;
+};
+
+/*──────────────────── Helper macros ───────────────────*/
+static inline int keycode(unsigned pin)
 {
-	/* Use joystick buttons first, then the extra "trigger happy" range. */
-	if (pin < PIUIO_NUM_REG)
-		return PIUIO_BTN_REG + pin;
-	pin -= PIUIO_NUM_REG;
-	return PIUIO_BTN_EXTRA + pin;
+    if (pin < PIUIO_NUM_REG)
+        return PIUIO_BTN_REG + pin;
+    return PIUIO_BTN_EXTRA + (pin - PIUIO_NUM_REG);
 }
 
-
-/*
- * URB completion handlers
- */
-static void piuio_in_completed(struct urb *urb)
+/*──────────────────── HID helpers ───────────────────*/
+static int piuio_hid_set_idle(struct usb_device *udev)
 {
-	struct piuio *piu = urb->context;
-	unsigned long changed[PIUIO_MSG_LONGS];
-	unsigned long b;
-	int i, s;
-	int cur_set;
-	int ret = urb->status;
-
-	if (ret) {
-		dev_warn(&piu->udev->dev, "piuio callback(in): error %d\n", ret);
-		goto resubmit;
-	}
-
-	/* Get the index of the previous input set (always 0 if no multiplexer) */
-	cur_set = (piu->set + piu->type->mplex - 1) % piu->type->mplex;
-
-	/* Note what has changed in this input set, then store the inputs for
-	 * next time */
-	for (i = 0; i < PIUIO_MSG_LONGS; i++) {
-		changed[i] = piu->inputs[i] ^ piu->old_inputs[cur_set][i];
-		piu->old_inputs[cur_set][i] = piu->inputs[i];
-	}
-
-	/* If we are using a multiplexer, changes only count when none of the
-	 * corresponding inputs in other sets are pressed.  Since "pressed"
-	 * reads as 0, we can use & to knock those bits out of the changes. */
-	for (s = 0; s < piu->type->mplex; s++) {
-		if (s == cur_set)
-			continue;
-		for (i = 0; i < PIUIO_MSG_LONGS; i++)
-			changed[i] &= piu->old_inputs[s][i];
-	}
-
-	/* For each input which has changed state, report whether it was pressed
-	 * or released based on the current value. */
-	for_each_set_bit(b, changed, piu->type->inputs) {
-		input_event(piu->idev, EV_MSC, MSC_SCAN, b + 1);
-		input_report_key(piu->idev, keycode(b), !test_bit(b, piu->inputs));
-	}
-
-	/* Done reporting input events */
-	input_sync(piu->idev);
-
-resubmit:
-	ret = usb_submit_urb(urb, GFP_ATOMIC);
-	if (ret == -EPERM)
-		dev_info(&piu->udev->dev, "piuio resubmit(in): shutdown\n");
-	else if (ret)
-		dev_err(&piu->udev->dev, "piuio resubmit(in): error %d\n", ret);
-
-	/* Let any waiting threads know we're done here */
-	wake_up(&piu->shutdown_wait);
+    return usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
+                           PIUIO_HID_SET_IDLE,
+                           USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                           0, 0, NULL, 0, 100);
 }
 
-static void piuio_out_completed(struct urb *urb)
+static int piuio_hid_get_report(struct piuio *piu)
 {
-	struct piuio *piu = urb->context;
-	int ret = urb->status;
-
-	if (ret) {
-		dev_warn(&piu->udev->dev, "piuio callback(out): error %d\n", ret);
-		goto resubmit;
-	}
-
-	/* Copy in the new outputs */
-	memcpy(piu->outputs, piu->new_outputs, PIUIO_MSG_SZ);
-
-	/* If we have a multiplexer, switch to the next input set in rotation
-	 * and set the appropriate output bits */
-	piu->set = (piu->set + 1) % piu->type->mplex;
-
-	/* Set multiplexer bits */
-	piu->outputs[0] &= ~((1 << piu->type->mplex_bits) - 1);
-	piu->outputs[0] |= piu->set;
-	piu->outputs[2] &= ~((1 << piu->type->mplex_bits) - 1);
-	piu->outputs[2] |= piu->set;
-	
-resubmit:
-	ret = usb_submit_urb(piu->out, GFP_ATOMIC);
-	if (ret == -EPERM)
-		dev_info(&piu->udev->dev, "piuio resubmit(out): shutdown\n");
-	else if (ret)
-		dev_err(&piu->udev->dev, "piuio resubmit(out): error %d\n", ret);
-
-	/* Let any waiting threads know we're done here */
-	wake_up(&piu->shutdown_wait);
+    return usb_control_msg(piu->udev, usb_rcvctrlpipe(piu->udev, 0),
+                           PIUIO_HID_GET_REPORT,
+                           USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                           (0x03 << 8) | PIUIO_HID_RPT_INPUT,
+                           0,
+                           piu->in_buf, PIUIO_HID_INPUT_SIZE, 100);
 }
 
-
-/*
- * Input device events
- */
-static int piuio_open(struct input_dev *idev)
+static int piuio_hid_set_report(struct piuio *piu, u8 rpt_id, const void *buf)
 {
-	struct piuio *piu = input_get_drvdata(idev);
-	int ret;
-
-	/* Kick off the polling */
-	ret = usb_submit_urb(piu->out, GFP_KERNEL);
-	if (ret) {
-		dev_err(&piu->udev->dev, "piuio submit(out): error %d\n", ret);
-		return -EIO;
-	}
-
-	ret = usb_submit_urb(piu->in, GFP_KERNEL);
-	if (ret) {
-		dev_err(&piu->udev->dev, "piuio submit(in): error %d\n", ret);
-		usb_kill_urb(piu->out);
-		return -EIO;
-	}
-
-	return 0;
+    return usb_control_msg(piu->udev, usb_sndctrlpipe(piu->udev, 0),
+                           PIUIO_HID_SET_REPORT,
+                           USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                           (0x03 << 8) | rpt_id, 0,
+                           (void *)buf, PIUIO_HID_OUTPUT_CHUNK, 100);
 }
 
-static void piuio_close(struct input_dev *idev)
+/*──────────────────── LED backend ───────────────────*/
+struct piuio_led { struct piuio *piu; struct led_classdev cdev; u8 index; };
+
+static void piuio_led_set(struct led_classdev *cdev, enum led_brightness b)
 {
-	struct piuio *piu = input_get_drvdata(idev);
-	long remaining;
+    struct piuio_led *led = container_of(cdev, struct piuio_led, cdev);
+    struct piuio *piu = led->piu;
+    u8 idx = led->index;
 
-	/* Stop polling, but wait for the last requests to complete */
-	usb_block_urb(piu->in);
-	usb_block_urb(piu->out);
-	remaining = wait_event_timeout(piu->shutdown_wait,
-			atomic_read(&piu->in->use_count) == 0 &&
-			atomic_read(&piu->out->use_count) == 0,
-			msecs_to_jiffies(5));
-	usb_unblock_urb(piu->in);
-	usb_unblock_urb(piu->out);
+    if (b)
+        __set_bit(idx, (unsigned long *)piu->led_shadow);
+    else
+        __clear_bit(idx, (unsigned long *)piu->led_shadow);
 
-	if (!remaining) {
-		// Timed out
-		dev_warn(&piu->udev->dev, "piuio close: urb timeout\n");
-		usb_kill_urb(piu->in);
-		usb_kill_urb(piu->out);
-	}
+    /* Legacy outputs are actually sent in the periodic OUT URB, so only do
+     * immediate writeback for HID boards. */
+    if (piu->proto != PROTO_HID)
+        return;
 
-	/* XXX Reset the outputs? */
+    /* HID output reports are banked 16 bits/bytes each. */
+    u8 bank  = idx / 16;
+    u8 rptid = PIUIO_HID_RPT_OUT_BASE + bank;
+    memcpy(piu->out_buf, &piu->led_shadow[bank * 2], PIUIO_HID_OUTPUT_CHUNK);
+    piuio_hid_set_report(piu, rptid, piu->out_buf);
 }
 
-
-/*
- * Led device event
- */
-static void piuio_led_set(struct led_classdev *dev, enum led_brightness b)
+/*──────────────────── Input handling ───────────────────*/
+static void piuio_handle_inputs(struct piuio *piu, const unsigned long *data)
 {
-	struct piuio_led *led = container_of(dev, struct piuio_led, dev);
-	struct piuio *piu = led->piu;
-	int n;
+    unsigned long diff[2];
+    unsigned long diff_idx;
 
-	n = led - piu->led;
-	if (n > piu->type->outputs) {
-		dev_err(&piu->udev->dev, "piuio led: bad number %d\n", n);
-		return;
-	}
+    diff[0] = data[0] ^ piu->prev_inputs[0];
+    diff[1] = data[1] ^ piu->prev_inputs[1];
+    piu->prev_inputs[0] = data[0];
+    piu->prev_inputs[1] = data[1];
 
-	/* Meh, forget atomicity, these aren't super-important */
-	if (b)
-		__set_bit(n, (unsigned long *) piu->new_outputs);
-	else
-		__clear_bit(n, (unsigned long *) piu->new_outputs);
+    for_each_set_bit(diff_idx, diff, piu->type->inputs) {
+        bool pressed = !test_bit(diff_idx, data); /* active‑low */
+        input_event(piu->idev, EV_MSC, MSC_SCAN, diff_idx + 1);
+        input_report_key(piu->idev, keycode(diff_idx), pressed);
+    }
+    input_sync(piu->idev);
 }
 
-
-/*
- * Structure initialization and destruction
- */
-static void piuio_input_init(struct piuio *piu, struct device *parent)
+/*──────────────────── URB callbacks (legacy path) ───────────────────*/
+static void piuio_vendor_in_cb(struct urb *urb)
 {
-	struct input_dev *idev = piu->idev;
-	int i;
+    struct piuio *piu = urb->context;
 
-	/* Fill in basic fields */
-	idev->name = "PIUIO input";
-	idev->phys = piu->phys;
-	usb_to_input_id(piu->udev, &idev->id);
-	idev->dev.parent = parent;
+    if (!urb->status)
+        piuio_handle_inputs(piu, (unsigned long *)piu->in_buf);
 
-	/* HACK: Buttons are sufficient to trigger a /dev/input/js* device, but
-	 * for systemd (and consequently udev and Xorg) to consider us a
-	 * joystick, we have to have a set of XY absolute axes. */
-	set_bit(EV_KEY, idev->evbit);
-	set_bit(EV_ABS, idev->evbit);
-
-	/* Configure buttons */
-	for (i = 0; i < piu->type->inputs; i++)
-		set_bit(keycode(i), idev->keybit);
-	clear_bit(0, idev->keybit);
-
-	/* Configure fake axes */
-	set_bit(ABS_X, idev->absbit);
-	set_bit(ABS_Y, idev->absbit);
-	input_set_abs_params(idev, ABS_X, 0, 0, 0, 0);
-	input_set_abs_params(idev, ABS_Y, 0, 0, 0, 0);
-
-	/* Set device callbacks */
-	idev->open = piuio_open;
-	idev->close = piuio_close;
-
-	/* Link input device back to PIUIO */
-	input_set_drvdata(idev, piu);
+    usb_submit_urb(urb, GFP_ATOMIC);
 }
 
-static int piuio_leds_init(struct piuio *piu)
+static void piuio_vendor_out_cb(struct urb *urb)
 {
-	int i;
-	const struct attribute_group **ag;
-	struct attribute **attr;
-	int ret;
+    struct piuio *piu = urb->context;
 
-	for (i = 0; i < piu->type->outputs; i++) {
-		/* Initialize led device and point back to piuio struct */
-		piu->led[i].dev.name = piu->type->led_names[i];
-		piu->led[i].dev.brightness_set = piuio_led_set;
-		piu->led[i].piu = piu;
+    /* rotate multiplex bank */
+    piu->set = (piu->set + 1) % piu->type->mplex;
+    piu->out_buf[0] &= ~((1 << piu->type->mplex_bits) - 1);
+    piu->out_buf[2] &= ~((1 << piu->type->mplex_bits) - 1);
+    piu->out_buf[0] |= piu->set;
+    piu->out_buf[2] |= piu->set;
 
-		/* Register led device */
-		ret = led_classdev_register(&piu->udev->dev, &piu->led[i].dev);
-		if (ret)
-			goto out_unregister;
-
-		/* Relax permissions on led attributes */
-		for (ag = piu->led[i].dev.dev->class->dev_groups; ag && *ag; ag++) {
-			for (attr = (*ag)->attrs; attr && *attr; attr++) {
-				ret = sysfs_chmod_file(&piu->led[i].dev.dev->kobj,
-						*attr, S_IRUGO | S_IWUGO);
-				if (ret) {
-					led_classdev_unregister(&piu->led[i].dev);
-					goto out_unregister;
-				}
-			}
-		}
-	}
-
-	return 0;
-
-out_unregister:
-	for (--i; i >= 0; i--)
-		led_classdev_unregister(&piu->led[i].dev);
-	return ret;
+    usb_submit_urb(urb, GFP_ATOMIC);
 }
 
-static void piuio_leds_destroy(struct piuio *piu)
+/*──────────────────── HID polling timer ───────────────────*/
+static void piuio_hid_timer(struct timer_list *t)
 {
-	int i;
-	for (i = 0; i < piu->type->outputs; i++)
-		led_classdev_unregister(&piu->led[i].dev);
+    struct piuio *piu = from_timer(piu, t, poll_timer);
+
+    if (piuio_hid_get_report(piu) == PIUIO_HID_INPUT_SIZE)
+        /* +2: skip report ID + reserved byte */
+        piuio_handle_inputs(piu, (unsigned long *)(piu->in_buf + 2));
+
+    mod_timer(&piu->poll_timer, jiffies + msecs_to_jiffies(4));
 }
 
-static int piuio_init(struct piuio *piu, struct input_dev *idev,
-		struct usb_device *udev)
+/*──────────────────── Probe / Disconnect ───────────────────*/
+static int piuio_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
-	/* Note: if this function returns an error, piuio_destroy will still be
-	 * called, so we don't need to clean up here */
+    struct usb_device *udev = interface_to_usbdev(intf);
+    struct piuio *piu;
+    struct input_dev *idev;
+    int i, err;
 
-	/* Allocate USB request blocks */
-	piu->in = usb_alloc_urb(0, GFP_KERNEL);
-	piu->out = usb_alloc_urb(0, GFP_KERNEL);
-	if (!piu->in || !piu->out) {
-		dev_err(&udev->dev, "piuio init: failed to allocate URBs\n");
-		return -ENOMEM;
-	}
+    piu = kzalloc(sizeof(*piu), GFP_KERNEL);
+    if (!piu)
+        return -ENOMEM;
 
-	/* Create dynamically allocated arrays */
-	piu->old_inputs = kzalloc(sizeof(*piu->old_inputs) * piu->type->mplex,
-		GFP_KERNEL);
-	if (!piu->old_inputs) {
-		dev_err(&udev->dev, "piuio init: failed to allocate old_inputs\n");
-		return -ENOMEM;
-	}
+    /*
+     * Detect which protocol path to use.
+     *  – HID interface class => modern board
+     *  – Otherwise look at VID/PID (button‑board vs full)
+     */
+    if (intf->cur_altsetting->desc.bInterfaceClass == USB_CLASS_HID) {
+        piu->proto = PROTO_HID;
+        piu->type  = &piuio_dev_hid;
+    } else if (id->idVendor == USB_VENDOR_ID_BTNBOARD &&
+               id->idProduct == USB_PRODUCT_ID_BTNBOARD) {
+        piu->proto = PROTO_VENDOR; /* small button‑board */
+        piu->type  = &piuio_dev_bb;
+    } else {
+        piu->proto = PROTO_VENDOR; /* full legacy */
+        piu->type  = &piuio_dev_full;
+    }
 
-	piu->led = kzalloc(sizeof(*piu->led) * piu->type->outputs, GFP_KERNEL);
-	if (!piu->led) {
-		dev_err(&udev->dev, "piuio init: failed to allocate led devices\n");
-		return -ENOMEM;
-	}
+    piu->udev = udev;
+    usb_make_path(udev, piu->phys, sizeof(piu->phys));
+    strlcat(piu->phys, "/input0", sizeof(piu->phys));
 
-	init_waitqueue_head(&piu->shutdown_wait);
+    /*──────────────── input device ────────────────*/
+    idev = input_allocate_device();
+    if (!idev) { err = -ENOMEM; goto err_free_piu; }
+    piu->idev = idev;
 
-	piu->idev = idev;
-	piu->udev = udev;
-	usb_make_path(udev, piu->phys, sizeof(piu->phys));
-	strlcat(piu->phys, "/input0", sizeof(piu->phys));
+    idev->name       = "PIUIO input";
+    idev->phys       = piu->phys;
+    usb_to_input_id(udev, &idev->id);
+    idev->dev.parent = &intf->dev;
 
-	/* Prepare URB for multiplexer and outputs */
-	piu->cr_out.bRequestType = USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE;
-	piu->cr_out.bRequest = cpu_to_le16(PIUIO_MSG_REQ);
-	piu->cr_out.wValue = cpu_to_le16(PIUIO_MSG_VAL);
-	piu->cr_out.wIndex = cpu_to_le16(PIUIO_MSG_IDX);
-	piu->cr_out.wLength = cpu_to_le16(PIUIO_MSG_SZ);
-	usb_fill_control_urb(piu->out, udev, usb_sndctrlpipe(udev, 0),
-			(void *) &piu->cr_out, piu->outputs, PIUIO_MSG_SZ,
-			piuio_out_completed, piu);
+    set_bit(EV_KEY, idev->evbit);
+    set_bit(EV_MSC, idev->evbit);
+    set_bit(MSC_SCAN, idev->mscbit);
 
-	/* Prepare URB for inputs */
-	piu->cr_in.bRequestType = USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE;
-	piu->cr_in.bRequest = cpu_to_le16(PIUIO_MSG_REQ);
-	piu->cr_in.wValue = cpu_to_le16(PIUIO_MSG_VAL);
-	piu->cr_in.wIndex = cpu_to_le16(PIUIO_MSG_IDX);
-	piu->cr_in.wLength = cpu_to_le16(PIUIO_MSG_SZ);
-	usb_fill_control_urb(piu->in, udev, usb_rcvctrlpipe(udev, 0),
-			(void *) &piu->cr_in, piu->inputs, PIUIO_MSG_SZ,
-			piuio_in_completed, piu);
+    for (i = 0; i < piu->type->inputs; i++)
+        set_bit(keycode(i), idev->keybit);
 
-	return 0;
-}
+    input_set_drvdata(idev, piu);
 
-static void piuio_destroy(struct piuio *piu)
-{
-	/* These handle NULL gracefully, so we can call this to clean up if init
-	 * fails */
-	kfree(piu->led);
-	kfree(piu->old_inputs);
-	usb_free_urb(piu->out);
-	usb_free_urb(piu->in);
-}
+    /*──────────────── LED registration ─────────────*/
+    piu->led = kcalloc(piu->type->outputs, sizeof(*piu->led), GFP_KERNEL);
+    if (!piu->led) { err = -ENOMEM; goto err_free_idev; }
 
+    for (i = 0; i < piu->type->outputs; i++) {
+        piu->led[i].piu            = piu;
+        piu->led[i].index          = i;
+        piu->led[i].cdev.name      = piu->type->led_names[i];
+        piu->led[i].cdev.brightness_set = piuio_led_set;
+        err = led_classdev_register(&intf->dev, &piu->led[i].cdev);
+        if (err) goto err_unregister_leds;
+    }
 
-/*
- * USB connect and disconnect events
- */
-static int piuio_probe(struct usb_interface *intf,
-			 const struct usb_device_id *id)
-{
-	struct piuio *piu;
-	struct usb_device *udev = interface_to_usbdev(intf);
-	struct input_dev *idev;
-	int ret = -ENOMEM;
+    /*──────────────── Protocol‑specific setup ─────*/
+    if (piu->proto == PROTO_HID) {
+        /* One‑shot idle handshake then start polling timer */
+        piuio_hid_set_idle(udev);
+        timer_setup(&piu->poll_timer, piuio_hid_timer, 0);
+        mod_timer(&piu->poll_timer, jiffies + msecs_to_jiffies(4));
+    } else {
+        /* Legacy URBs */
+        piu->urb_in  = usb_alloc_urb(0, GFP_KERNEL);
+        piu->urb_out = usb_alloc_urb(0, GFP_KERNEL);
+        if (!piu->urb_in || !piu->urb_out) { err = -ENOMEM; goto err_unregister_leds; }
 
-	/* Allocate PIUIO state and determine device type */
-	piu = kzalloc(sizeof(struct piuio), GFP_KERNEL);
-	if (!piu) {
-		dev_err(&intf->dev, "piuio probe: failed to allocate state\n");
-		return ret;
-	}
+        /* OUT URB (mux + outputs) */
+        piu->cr_out.bRequestType = USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE;
+        piu->cr_out.bRequest     = PIUIO_VND_REQ;
+        piu->cr_out.wValue       = cpu_to_le16(PIUIO_VND_VAL);
+        piu->cr_out.wIndex       = cpu_to_le16(PIUIO_VND_IDX);
+        piu->cr_out.wLength      = cpu_to_le16(PIUIO_VND_SZ);
+        usb_fill_control_urb(piu->urb_out, udev, usb_sndctrlpipe(udev, 0),
+                             (void *)&piu->cr_out, piu->out_buf, PIUIO_VND_SZ,
+                             piuio_vendor_out_cb, piu);
 
-	if (id->idVendor == USB_VENDOR_ID_BTNBOARD &&
-			id->idProduct == USB_PRODUCT_ID_BTNBOARD) {
-		/* Button board card */
-		piu->type = &piuio_dev_bb;
-	} else {
-		/* Full card */
-		piu->type = &piuio_dev_full;
-	}
+        /* IN URB (inputs) */
+        piu->cr_in.bRequestType = USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE;
+        piu->cr_in.bRequest     = PIUIO_VND_REQ;
+        piu->cr_in.wValue       = cpu_to_le16(PIUIO_VND_VAL);
+        piu->cr_in.wIndex       = cpu_to_le16(PIUIO_VND_IDX);
+        piu->cr_in.wLength      = cpu_to_le16(PIUIO_VND_SZ);
+        usb_fill_control_urb(piu->urb_in, udev, usb_rcvctrlpipe(udev, 0),
+                             (void *)&piu->cr_in, piu->in_buf, PIUIO_VND_SZ,
+                             piuio_vendor_in_cb, piu);
 
-	/* Allocate input device for generating buttonpresses */
-	idev = input_allocate_device();
-	if (!idev) {
-		dev_err(&intf->dev, "piuio probe: failed to allocate input dev\n");
-		kfree(piu->old_inputs);
-		kfree(piu);
-		return ret;
-	}
+        usb_submit_urb(piu->urb_out, GFP_KERNEL);
+        usb_submit_urb(piu->urb_in,  GFP_KERNEL);
+    }
 
-	/* Initialize PIUIO state and input device */
-	ret = piuio_init(piu, idev, udev);
-	if (ret)
-		goto err;
+    /* register input last so userspace sees fully initialised device */
+    err = input_register_device(idev);
+    if (err) goto err_stop_proto;
 
-	piuio_input_init(piu, &intf->dev);
+    usb_set_intfdata(intf, piu);
+    return 0;
 
-	/* Initialize and register led devices */
-	ret = piuio_leds_init(piu);
-	if (ret)
-		goto err;
-
-	/* Register input device */
-	ret = input_register_device(piu->idev);
-	if (ret) {
-		dev_err(&intf->dev, "piuio probe: failed to register input dev\n");
-		piuio_leds_destroy(piu);
-		goto err;
-	}
-
-	/* Final USB setup */
-	usb_set_intfdata(intf, piu);
-	return 0;
-
-err:
-	piuio_destroy(piu);
-	input_free_device(idev);
-	kfree(piu);
-	return ret;
+err_stop_proto:
+    if (piu->proto == PROTO_HID)
+        del_timer_sync(&piu->poll_timer);
+    else {
+        if (piu->urb_in)  usb_kill_urb(piu->urb_in);
+        if (piu->urb_out) usb_kill_urb(piu->urb_out);
+    }
+err_unregister_leds:
+    while (--i >= 0)
+        led_classdev_unregister(&piu->led[i].cdev);
+    kfree(piu->led);
+err_free_idev:
+    input_free_device(idev);
+err_free_piu:
+    kfree(piu);
+    return err;
 }
 
 static void piuio_disconnect(struct usb_interface *intf)
 {
-	struct piuio *piu = usb_get_intfdata(intf);
+    struct piuio *piu = usb_get_intfdata(intf);
+    int i;
 
-	usb_set_intfdata(intf, NULL);
-	if (!piu) {
-		dev_err(&intf->dev, "piuio disconnect: uninitialized device?\n");
-		return;
-	}
+    if (!piu) return;
 
-	usb_kill_urb(piu->in);
-	usb_kill_urb(piu->out);
-	piuio_leds_destroy(piu);
-	input_unregister_device(piu->idev);
-	piuio_destroy(piu);
-	kfree(piu);
+    if (piu->proto == PROTO_HID)
+        del_timer_sync(&piu->poll_timer);
+    else {
+        usb_kill_urb(piu->urb_in);
+        usb_kill_urb(piu->urb_out);
+        usb_free_urb(piu->urb_in);
+        usb_free_urb(piu->urb_out);
+    }
+
+    for (i = 0; i < piu->type->outputs; i++)
+        led_classdev_unregister(&piu->led[i].cdev);
+
+    input_unregister_device(piu->idev);
+    kfree(piu->led);
+    kfree(piu);
 }
 
-
-/*
- * USB driver and module definitions
- */
-static struct usb_device_id piuio_id_table[] = {
-	/* Python WDM2 Encoder used for PIUIO boards */
-	{ USB_DEVICE(USB_VENDOR_ID_ANCHOR, USB_PRODUCT_ID_PYTHON2) },
-	/* Special USB ID for button board devices */
-	{ USB_DEVICE(USB_VENDOR_ID_BTNBOARD, USB_PRODUCT_ID_BTNBOARD) },
-	{},
+/*────────── USB id table ─────────*/
+static const struct usb_device_id piuio_ids[] = {
+    { USB_DEVICE(USB_VENDOR_ID_ANCHOR,  USB_PRODUCT_ID_PYTHON2) },
+    { USB_DEVICE(USB_VENDOR_ID_BTNBOARD, USB_PRODUCT_ID_BTNBOARD) },
+    { }
 };
-
-MODULE_DEVICE_TABLE(usb, piuio_id_table);
+MODULE_DEVICE_TABLE(usb, piuio_ids);
 
 static struct usb_driver piuio_driver = {
-	.name =		"piuio",
-	.probe =	piuio_probe,
-	.disconnect =	piuio_disconnect,
-	.id_table =	piuio_id_table,
+    .name       = "piuio_unified",
+    .probe      = piuio_probe,
+    .disconnect = piuio_disconnect,
+    .id_table   = piuio_ids,
 };
-
-MODULE_AUTHOR("Devin J. Pohly");
-MODULE_DESCRIPTION("PIUIO input/output driver");
-MODULE_VERSION("1.0");
-MODULE_LICENSE("GPL");
-
 module_usb_driver(piuio_driver);
+
+MODULE_AUTHOR("Diego Acevedo");
+MODULE_DESCRIPTION("Unified PIUIO I/O driver");
+MODULE_LICENSE("GPL v2");
