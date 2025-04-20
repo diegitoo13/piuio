@@ -17,7 +17,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y linux-headers-$(uname -r)
 
       - name: Build PIUIO module
+        working-directory: mod
         run: make -C /lib/modules/$(uname -r)/build M=$PWD modules
+
 
       - name: Run self‑tests
         run: |
