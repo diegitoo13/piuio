@@ -238,6 +238,8 @@ static ssize_t piuio_dev_write(struct file *filp,
                                size_t len, loff_t *off)
 {
     struct piuio *piu = filp->private_data;
+    // Use size_t for size calculations consistently
+    const size_t legacy_bits = PIUIO_LEGACY_SIZE * 8;
     u8 tmp[PIUIO_LEGACY_SIZE];
     int pin, ret = 0;
     int first_error = 0;
@@ -248,14 +250,15 @@ static ssize_t piuio_dev_write(struct file *filp,
         return -EFAULT;
 
     spin_lock(&piu->lock);
-    // Clear and set only the LEDs controlled by the legacy interface
-    memset(piu->led_shadow, 0, PIUIO_LEGACY_SIZE * 8);
-    for (pin = 0; pin < PIUIO_LEGACY_SIZE*8 && pin < PIUIO_MAX_LEDS; pin++)
+    // FIX: Limit memset to the smaller of the legacy size or the actual buffer size
+    memset(piu->led_shadow, 0, min_t(size_t, legacy_bits / 8, PIUIO_MAX_LEDS));
+    // Set bits based on input, respecting buffer boundary
+    for (pin = 0; pin < legacy_bits && pin < PIUIO_MAX_LEDS; pin++)
         piu->led_shadow[pin] = !!(tmp[pin/8] & (1 << (pin%8)));
     spin_unlock(&piu->lock);
 
-    // Update all relevant output banks using legacy method
-    for (pin = 0; pin < PIUIO_LEGACY_SIZE*8 && pin < PIUIO_MAX_LEDS; pin += PIUIO_OUTPUT_CHUNK) {
+    // Update relevant output banks using legacy method
+    for (pin = 0; pin < legacy_bits && pin < PIUIO_MAX_LEDS; pin += PIUIO_OUTPUT_CHUNK) {
          ret = piuio_set_report_legacy_ctrl(piu, PIUIO_RPT_OUT_BASE + (pin / PIUIO_OUTPUT_CHUNK));
          if (ret < 0 && first_error == 0) {
               first_error = ret; // Store first error
