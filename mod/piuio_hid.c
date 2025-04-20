@@ -27,7 +27,7 @@
 #include <linux/input.h>    // Input subsystem
 #include <linux/usb.h>      // USB core
 #include <linux/hid.h>      // USB HID core
-#include <linux/miscdevice.h>// Misc device framework
+#include <linux/miscdevice.h>// <--- ENSURE THIS LINE IS PRESENT
 #include <linux/fs.h>       // file_operations
 #include <linux/uaccess.h>  // copy_from_user
 #include <linux/spinlock.h> // spinlock
@@ -64,7 +64,7 @@ static inline int piuio_keycode(unsigned pin)
 /**
  * piuio_get_input_report - Poll device for input using GET_REPORT control transfer.
  * @piu: Device instance data.
- * @buffer: Buffer to store the received report data.
+ * @buffer: Buffer to store the received report data. (Assumed embedded array)
  * @buf_len: Size of the provided buffer.
  *
  * Uses GET_REPORT (Input Report ID 1) based on logs/python script.
@@ -75,8 +75,6 @@ static int piuio_get_input_report(struct piuio *piu, u8 *buffer, size_t buf_len)
 {
 	int ret;
 
-	// NOTE: Removed check for !buffer as it's likely an array within piu
-
 	// Parameters from logs/python: reqType=0xA1, req=1, val=0x0301, idx=iface
 	ret = usb_control_msg(
 		piu->udev,
@@ -85,7 +83,7 @@ static int piuio_get_input_report(struct piuio *piu, u8 *buffer, size_t buf_len)
 		USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE, // 0xA1
 		(HID_INPUT_REPORT << 8) | PIUIO_INPUT_REPORT_ID, // wValue (Report Type = Input | Report ID = 1)
 		piu->iface, // wIndex (Interface)
-		buffer,     // data buffer (address of embedded array)
+		buffer,     // data buffer
 		buf_len,    // max length to read
 		msecs_to_jiffies(50)); // Short timeout for polling
 
@@ -125,7 +123,7 @@ static int piuio_set_report_legacy_ctrl(struct piuio *piu, u8 rptid)
 
 	buf[0] = rptid; // Report ID
 	spin_lock(&piu->lock);
-	// Assume led_shadow is valid array if piu is valid
+	// Assume led_shadow is valid embedded array
 	for (i = 0; i < PIUIO_OUTPUT_CHUNK; i++) {
 		int idx = bank * PIUIO_OUTPUT_CHUNK + i;
 		buf[i+1] = (idx < PIUIO_MAX_LEDS && piu->led_shadow[idx]) ? 1 : 0;
@@ -198,20 +196,17 @@ static int piuio_send_output_interrupt(struct piuio *piu)
 	if (!piu || !piu->output_urb) {
 		pr_err("piuio: Invalid state in piuio_send_output_interrupt (piu=%p, urb=%p)\n",
 			   piu, piu ? piu->output_urb : NULL);
-		// Cannot proceed without URB if needed
 		return -EFAULT;
 	}
-	// output_buf and led_shadow are likely arrays, assume valid if piu is valid
+	// Assume output_buf and led_shadow are embedded arrays
 
 	if (!mutex_trylock(&piu->output_mutex)) {
 		hid_dbg(piu->hdev, "Output mutex busy, skipping send\n");
 		return -EBUSY;
 	}
 
-	// output_buf is assumed to be an array within piu now
 	memset(piu->output_buf, 0, PIUIO_OUTPUT_SIZE_NEW);
 	spin_lock(&piu->lock);
-	// led_shadow is assumed to be an array within piu now
 	for (i = 0; i < PIUIO_MAX_LEDS && i < (PIUIO_OUTPUT_SIZE_NEW * 8); i++) {
 		if (piu->led_shadow[i]) {
 			__set_bit(i, (unsigned long *)piu->output_buf);
@@ -223,7 +218,7 @@ static int piuio_send_output_interrupt(struct piuio *piu)
 	pipe = usb_sndintpipe(piu->udev, 0x02);
 
 	usb_fill_int_urb(piu->output_urb, piu->udev, pipe,
-					 piu->output_buf, PIUIO_OUTPUT_SIZE_NEW, // Pass address of array
+					 piu->output_buf, PIUIO_OUTPUT_SIZE_NEW,
 					 piuio_output_report_interrupt_complete, piu,
 					 1);
 
@@ -255,17 +250,16 @@ static enum hrtimer_restart piuio_timer_cb(struct hrtimer *timer)
 	int inputs_to_process = 0;
 	int num_longs = 0;
 	bool state_changed = false;
-	// Use pointer directly to embedded array
-	const unsigned long *current_data_bits = (unsigned long *)piu->in_buf;
+	const unsigned long *current_data_bits = (unsigned long *)piu->in_buf; // Direct pointer to embedded array
 	int bit_index;
 
-	// Check only piu and pointers known to be potentially NULL (idev?)
+	// Check essential pointers
 	if (!piu || !piu->hdev || !piu->idev) {
 		pr_err("piuio: Invalid state in timer callback! Aborting poll. (piu=%p, hdev=%p, idev=%p)\n",
 			   piu, piu ? piu->hdev : NULL, piu ? piu->idev : NULL);
 		return HRTIMER_NORESTART;
 	}
-	// Assume in_buf and prev_inputs are valid arrays if piu is valid
+	// Assume in_buf and prev_inputs are valid embedded arrays
 
 	hid_dbg(piu->hdev, "Timer callback entered\n");
 
@@ -297,20 +291,19 @@ static enum hrtimer_restart piuio_timer_cb(struct hrtimer *timer)
 		goto reschedule;
 	}
 
-
 	inputs_to_process = min(max_inputs_in_report, PIUIO_NUM_INPUTS);
 	num_longs = BITS_TO_LONGS(inputs_to_process);
 
 	hid_dbg(piu->hdev, "Comparing %d input bits (%d longs)\n", inputs_to_process, num_longs);
 
 	for (i = 0; i < num_longs; i++) {
-		// Bounds check
+		// Bounds check before dereferencing potentially calculated addresses
 		if (((void*)piu->in_buf + (i * sizeof(unsigned long))) >= ((void*)piu->in_buf + size)) {
 			hid_warn(piu->hdev, "Bounds check failed reading input state (long %d)\n", i);
 			break;
 		}
 		unsigned long current_bits = current_data_bits[i];
-		unsigned long changed_bits = current_bits ^ piu->prev_inputs[i]; // Access embedded arrays
+		unsigned long changed_bits = current_bits ^ piu->prev_inputs[i];
 
 		if (changed_bits != 0) {
 			hid_dbg(piu->hdev, "Input change detected in long %d (changed=0x%lx)\n", i, changed_bits);
@@ -358,6 +351,7 @@ static int piuio_led_set(struct led_classdev *cdev,
 		pr_err("piuio: Invalid state in led_set (piu=%p)\n", piu);
 		return -ENODEV;
 	}
+	// Assume led_shadow is valid embedded array
 
 	if (ld->idx >= PIUIO_MAX_LEDS) {
 		hid_warn(piu->hdev, "LED index %d out of range\n", ld->idx);
@@ -367,7 +361,6 @@ static int piuio_led_set(struct led_classdev *cdev,
 	hid_dbg(piu->hdev, "Setting LED %d to brightness %d\n", ld->idx, b);
 
 	spin_lock(&piu->lock);
-	// Assume led_shadow is a valid embedded array
 	piu->led_shadow[ld->idx] = (b > 0);
 	spin_unlock(&piu->lock);
 
@@ -412,7 +405,7 @@ static ssize_t piuio_dev_write(struct file *filp,
 		pr_err("piuio: Invalid state in dev_write (piu=%p)\n", piu);
 		return -ENODEV;
 	}
-	// Assume led_shadow array is valid if piu is valid
+	// Assume led_shadow is valid embedded array
 
 	hid_dbg(piu->hdev, "Write to legacy device /dev/%s, len=%zu\n", piu->misc.name, len);
 
@@ -485,7 +478,6 @@ static int piuio_probe(struct hid_device *hdev,
 	struct usb_interface *intf;
 	struct usb_endpoint_descriptor *ep_out = NULL;
 	int i, ret;
-	// Removed calculation for prev_inputs_size as it's an array now
 
 	hid_info(hdev, "Probing PIUIO device %04X:%04X\n", id->vendor, id->product);
 
@@ -510,10 +502,11 @@ static int piuio_probe(struct hid_device *hdev,
 	spin_lock_init(&piu->lock);
 	mutex_init(&piu->output_mutex);
 
-	// --- Buffers in_buf and prev_inputs are now embedded arrays ---
-	// --- No separate allocation needed ---
+	// Buffers in_buf, prev_inputs, led_shadow assumed embedded in struct piuio
+	// No separate allocations needed for them. Log their addresses/sizes.
 	hid_info(hdev, "Using embedded input buffer: %p (size %d)", piu->in_buf, PIUIO_INPUT_BUF_SIZE);
 	hid_info(hdev, "Using embedded prev_inputs buffer: %p (size %zu longs)", piu->prev_inputs, BITS_TO_LONGS(PIUIO_NUM_INPUTS));
+	hid_info(hdev, "Using embedded LED shadow buffer: %p (size %d)", piu->led_shadow, PIUIO_MAX_LEDS);
 
 
 	// --- Input device setup ---
@@ -554,12 +547,7 @@ static int piuio_probe(struct hid_device *hdev,
 		hid_err(hdev, "Failed to allocate LED structures\n");
 		return -ENOMEM;
 	}
-	// NOTE: Assumes led_shadow is also an embedded array within piu
-	// If it's a pointer, it needs allocation here like we tried before!
-	// Check piuio_hid.h for definition of struct piuio { ... u8 led_shadow[]; ... }
 	hid_info(hdev, "Allocated %d LED structures", PIUIO_MAX_LEDS);
-	hid_info(hdev, "Using embedded LED shadow buffer: %p (size %d)", piu->led_shadow, PIUIO_MAX_LEDS);
-
 
 	for (i = 0; i < PIUIO_MAX_LEDS; i++) {
 		piu->led[i].piu = piu;
@@ -596,15 +584,12 @@ static int piuio_probe(struct hid_device *hdev,
 		hid_err(hdev, "Failed to register misc device '%s': %d\n", piu->misc.name, ret);
 		return ret;
 	}
-	misc_set_drvdata(&piu->misc, piu);
+	misc_set_drvdata(&piu->misc, piu); // Ensure drvdata is set for fops
 	hid_info(hdev, "Registered misc device /dev/%s\n", piu->misc.name);
 
 
 	// --- Setup for Interrupt OUT URB (only needed if 1020 support uses it) ---
 	piu->output_urb = NULL;
-	// output_buf is assumed to be an embedded array now
-	// piu->output_buf = NULL; // Remove this if it's an array
-
 	for (i = 0; i < intf->cur_altsetting->desc.bNumEndpoints; i++) {
 		struct usb_endpoint_descriptor *ep = &intf->cur_altsetting->endpoint[i].desc;
 		if (usb_endpoint_is_int_out(ep)) {
@@ -618,12 +603,11 @@ static int piuio_probe(struct hid_device *hdev,
 		if (!ep_out || ep_out->bEndpointAddress != 0x02) {
 			hid_warn(hdev, "Interrupt OUT endpoint 0x02 not found or incorrect for 1020 device. Output may not work.\n");
 		} else {
-			// output_buf is assumed embedded, check size if needed
-			// Size check example: if (sizeof(piu->output_buf) < PIUIO_OUTPUT_SIZE_NEW) ... error ...
-			piu->output_urb = usb_alloc_urb(0, GFP_KERNEL);
+			// output_buf is assumed embedded
+			piu->output_urb = usb_alloc_urb(0, GFP_KERNEL); // Not device-managed
 			if (!piu->output_urb) {
 				hid_err(hdev, "Failed to allocate output URB\n");
-				misc_deregister(&piu->misc);
+				misc_deregister(&piu->misc); // Manually deregister miscdev on this error path
 				return -ENOMEM;
 			}
 			 hid_info(hdev, "Allocated URB %p for Interrupt OUT EP 0x%02x\n",
@@ -636,8 +620,8 @@ static int piuio_probe(struct hid_device *hdev,
 	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT & ~HID_CONNECT_HIDINPUT);
 	if (ret) {
 		hid_err(hdev, "hid_hw_start failed: %d\n", ret);
-		usb_free_urb(piu->output_urb);
-		misc_deregister(&piu->misc);
+		usb_free_urb(piu->output_urb); // Manually free URB
+		misc_deregister(&piu->misc); // Manually deregister miscdev
 		return ret;
 	}
 	hid_info(hdev, "hid_hw_start successful");
@@ -718,26 +702,28 @@ static void piuio_remove(struct hid_device *hdev)
 	if (piu->output_urb) {
 		hid_info(hdev, "Killing and freeing output URB %p...\n", piu->output_urb);
 		usb_kill_urb(piu->output_urb);
-		usb_free_urb(piu->output_urb);
+		usb_free_urb(piu->output_urb); // Free non-devm URB
 		hid_info(hdev, "Output URB freed.");
 	}
 
+	// No need to explicitly close/stop if hid_hw_start used HID_CONNECT_DEFAULT?
+	// Let's keep them for robustness, ensures cleanup order.
 	hid_info(hdev, "Closing HID hardware...");
 	hid_hw_close(hdev);
 	hid_info(hdev, "HID hardware closed.");
-
 
 	hid_info(hdev, "Stopping HID hardware...");
 	hid_hw_stop(hdev);
 	hid_info(hdev, "HID hardware stopped.");
 
-
+	// misc device was registered, need to deregister.
+	// misc_name is device-managed now.
 	hid_info(hdev, "Deregistering misc device /dev/%s...", piu->misc.name);
 	misc_deregister(&piu->misc);
 	hid_info(hdev, "Misc device deregistered.");
 
 
-	// devm_* functions handle cleanup automatically
+	// devm_* functions automatically clean up remaining resources.
 	hid_info(hdev, "PIUIO HID Driver remove finished.\n");
 }
 
@@ -764,4 +750,3 @@ module_hid_driver(piuio_driver);
 MODULE_AUTHOR("Diego Acevedo");
 MODULE_DESCRIPTION("PIUIO HID interface driver");
 MODULE_LICENSE("GPL v2");
-
