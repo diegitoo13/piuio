@@ -1,49 +1,24 @@
-name: Build & Smoke-test PIUIO
+obj-m         := piuio_hid.o
 
-on:
-  push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
+KVER          := $(shell uname -r)
+KBUILD_PATH   := /lib/modules/$(KVER)/build
+MOD_DIR       := /lib/modules/$(KVER)/kernel/drivers/misc
 
-jobs:
-  smoke-test:
-    runs-on: ubuntu-22.04
+.PHONY: all modules install uninstall clean
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+all: modules
 
-      - name: Install generic kernel headers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y linux-headers-generic
+modules:
+	$(MAKE) -C $(KBUILD_PATH) M=$(PWD) modules
 
-      - name: Set kernel version
-        id: set-kver
-        run: echo "KVER=$(ls /lib/modules | grep -v azure | head -n1)" >> $GITHUB_ENV
+install: modules
+	sudo mkdir -p $(MOD_DIR)
+	sudo cp piuio_hid.ko $(MOD_DIR)
+	sudo depmod -a
 
-      # --- THIS IS THE ADDED STEP ---
-      - name: Prepare kernel headers
-        # This step runs 'make scripts' in the kernel headers source directory.
-        # It prepares the build environment and ensures necessary tools/scripts
-        # are available, resolving issues like missing 'syscall_32.tbl'.
-        run: sudo make -C /lib/modules/${{ env.KVER }}/build scripts
-      # --- END OF ADDED STEP ---
+uninstall:
+	sudo rm -f $(MOD_DIR)/piuio_hid.ko
+	sudo depmod -a
 
-      - name: Build module
-        working-directory: mod
-        run: make KVER=$KVER
-
-      - name: Smoke-test install
-        working-directory: mod
-        run: |
-          sudo make KVER=$KVER install
-          lsmod | grep piuio_hid
-
-      - name: Smoke-test uninstall
-        working-directory: mod
-        run: |
-          sudo make KVER=$KVER uninstall
-          ! lsmod | grep piuio_hid
-
+clean:
+	$(MAKE) -C $(KBUILD_PATH) M=$(PWD) clean
