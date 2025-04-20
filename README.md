@@ -1,136 +1,39 @@
-PIUIO input driver for Linux
-============================
+# PIUIO HID Driver for Linux
 
-This is a driver for the PIUIO arcade I/O board that maps panels and buttons to
-a standard Linux event interface which typically appears as a joystick.
+This is a Linux kernel module driver for Andamiro PIUIO arcade I/O boards, interfacing via the standard HID subsystem.
 
+## Features
 
-Compiling and installing
-------------------------
+* Provides input events for panels/buttons via the Linux input subsystem (e.g., `/dev/input/eventX`).
+* Provides LED control via the Linux LED subsystem (`/sys/class/leds/`).
+* Provides a legacy `/dev/piuioX` character device interface for compatibility with some older applications.
+* Supports Product IDs `0x1010` (legacy) and `0x1020` (newer).
 
-To compile the kernel module, run `make` inside the `mod` directory.  This will
-build a kernel object file `piuio.ko` which is compatible with your currently
-installed kernel.  To build against different kernel headers, you may specify
-the path to a source tree using the `KDIR` variable when building, e.g.:
+## Current Status (Work In Progress)
 
-    make KDIR=~/src/linux-3.15.7
+* **Device Matching:** Matches both `0d2f:1010` and `0d2f:1020` devices.
+* **Initialization (`0x1020`):** Successfully sends the required `SET_IDLE` command.
+* **Input Handling (`0x1020`):** Uses standard HID `raw_event` callback. Parses the known 16-byte input report size. **Note:** The exact bit-to-button mapping within the 16 bytes is currently assumed and may need refinement based on testing or the device's HID Report Descriptor.
+* **Input Handling (`0x1010`):** The input report mechanism and format for the legacy device are currently **unknown**. Input events for this device are **ignored** until its protocol is determined.
+* **Output/LED Handling:** Uses legacy `SET_REPORT` control transfers. This may be incorrect for the `0x1020` device and needs verification/potential update to use its defined 16-byte Output report (likely via the interrupt OUT endpoint).
 
-To install this module once you have built it, use the `make install` command.
-By default this will attempt to install the module directly to your system;
-note that doing so will require root privileges.  To specify a path under
-which to install (e.g. for packaging), you can specify a `DESTDIR`:
+## Compiling and Installing
 
-    make DESTDIR="$pkgdir" install
+1.  Ensure you have the kernel headers installed for your running kernel (e.g., `sudo apt install linux-headers-$(uname -r)` on Debian/Ubuntu).
+2.  Navigate to the `mod` directory containing `piuio_hid.c`, `piuio_hid.h`, and `Makefile`.
+3.  Run `make` to compile `piuio_hid.ko`.
+4.  Run `sudo make install` to copy the module to `/lib/modules/$(uname -r)/updates/` and update module dependencies. (Requires root privileges).
+5.  Load the module: `sudo modprobe piuio_hid`
+6.  Unload the module: `sudo rmmod piuio_hid`
 
-Note: during this step, you may see the following error:
+## Testing
 
-    At main.c:160:
-    - SSL error:02001002:system library:fopen:No such file or directory: crypto/bio/bss_file.c:72
-    - SSL error:2006D080:BIO routines:BIO_new_file:no such file: crypto/bio/bss_file.c:79
-    sign-file: certs/signing_key.pem: No such file or directory
+* **Input:** Use tools like `evtest` (install if needed) on the relevant `/dev/input/eventX` device created when the driver binds.
+* **Output (LEDs):** Control LEDs via `/sys/class/leds/`. Find the LED names associated with your device (e.g., `/sys/class/leds/piuio-0003:0D2F:1020.XXXX::outputY`) and echo 0 or 1 to the `brightness` file (e.g., `echo 1 | sudo tee /sys/class/leds/DEVICE_NAME::output3/brightness`). *Note: LED control might not work correctly for the 1020 device yet.*
+* **Legacy Device:** Test applications using `/dev/piuio0` (or similar).
 
-Unless you are trying to build a cryptographically signed module, you may
-safely ignore these messages.
+## Contributing / Further Work
 
-
-Tools for testing
------------------
-
-Since this module uses the input subsystem, you can use standard tools such as
-[evemu](http://cgit.freedesktop.org/evemu/) to test it.  Outputs are
-implemented using the leds subsystem and are consequently located in the
-`/sys/class/leds` directory.  You can test these by echoing zero/nonzero values
-to the `brightness` file in a given led directory:
-
-    echo 1 > /sys/class/leds/piuio::output3/brightness
-
-
-Implementation and accuracy
----------------------------
-
-This driver is designed to provide the fastest possible response to
-inputs, and thereby the best possible timing accuracy.  Below are some of
-the considerations made in reducing the time from triggering an input
-sensor to generating the input event.
-
-
-### Polled input devices ###
-
-The Linux kernel provides the `input_polldev` framework for input devices
-such as the PIUIO which must be polled rather than generating interrupts.
-This framework allows the driver to define a `poll` function which is
-called at regular intervals to generate input events.
-
-Unfortunately, this framework is designed for general input devices, such
-as keyboards, where accurate event timing is not critical.  As a result
-the mechanics behind its implementation can lead to extra time between
-polls.  This driver implements polling itself to avoid the extra delay
-(which is compounded by the use of a multiplexer as described below).
-
-
-### USB protocol and multiplexer ###
-
-PIUIO units are typically attached to a four-way multiplexer so that four
-sensors can be connected to each input.  If any one sensor is triggered, the
-input is considered to be pressed.  The current implementation assumes that
-such a multiplexer is in use.  At a low level, the driver must send a USB
-output message to select one set of sensors from the multiplexer, then an
-input message to read their values.
-
-However, the USB standard requires that each message consist of a request
-from the host and a response from the device, and only one of those may
-carry data.  Because of this, the output message to set up the multiplexer
-and the input message to request the sensor state cannot be combined in
-one round-trip from host to device and back; two round-trips are
-necessary.
-
-To get the best possible timing accuracy, these internal mechanics have to
-be taken into account.
-
-
-### Staggered input reporting ###
-
-The first accuracy improvement that this driver makes is taking a different
-approach with respect to when input events are reported.  Previous drivers,
-as well as previous versions of this driver, have used a "block" strategy
-when polling multiple sets of sensors.  With this approach, each set is
-polled once, the results are combined, and then any changes in the input are
-reported as press or release events.
-
-Remember that polling one set of sensors requires two USB messages.  This
-means that, in a typical setup with four sensor sets, eight round-trips take
-place between consecutive polls of the same sensor.  So the delay between a
-change in the state of any given sensor and the corresponding input event
-will range from 0 to 8 RTTs, with an average of 4.
-
-This driver instead staggers the input reporting.  After each set of sensors
-is polled, input events are generated, using the most recent polled values
-from the other sets.
-
-At first, this does not seem to change anything, since there are still eight
-round-trips between consecutive polls of a single sensor.  However, consider
-the case in which more than one related sensor is triggered at the same time
-(for example, if there are multiple sensors under a single panel).  The time
-from trigger to input event will be that of the sensor which will be polled
-next, i.e. the one with the least delay.
-
-With the block strategy, the average delay is always 4 RTTs, even if
-multiple sensors are triggered.  With the staggered strategy, hitting one
-sensor will average 4 RTTs, two sensors 2.33 RTTs, three sensors 1.5 RTTs,
-and hitting all four related sensors will bring the average delay to 1 RTT.
-
-Given that the typical round-trip response time for a PIUIO device is 250
-μs, this means this is the first PIUIO driver capable of sub-millisecond
-accuracy on average.
-
-
-### Message queueing ###
-
-However, there is something else that can be done to reduce delay and
-improve accuracy.  USB messages can be queued asynchronously so that they
-are sent as quickly as possible, one after the other.  There is no need to
-wait for an output message to complete before sending the following input
-message, and vice versa.  This means that one response can be processed
-while the next request is already being sent, using the USB link much more
-efficiently.  In testing, the asynchronous driver was able to handle
-requests 35–40% faster than synchronous drivers.
+* Determine the exact input report format for the `0x1020` device.
+* Determine the input report mechanism (interrupt/control?) and format for the legacy `0x1010` device.
+* Verify and correct the output (LED) control mechanism for both devices based on their HID descriptors and behavior.

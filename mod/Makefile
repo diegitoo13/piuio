@@ -1,29 +1,26 @@
-ifneq ($(PATCHLEVEL),)
+ifneq ($(KERNELRELEASE),)
+    # Kbuild part of makefile
+    obj-m := piuio_hid.o 
 
-# Kbuild configuration
-obj-m := piuio.o
-
+# Building external module
 else
+    # Default to building for the currently running kernel
+    KVER ?= $(shell uname -r)
+    KDIR ?= /lib/modules/$(KVER)/build
 
-# Default to building for the currently running kernel
-KVER ?= $(shell uname -r)
-KDIR ?= /lib/modules/$(KVER)/build
+    # If DESTDIR is given, output there for staging (e.g., packaging)
+    INSTALL_MOD_PATH ?= $(DESTDIR)
+    export INSTALL_MOD_PATH
 
-# If DESTDIR is given, output there
-INSTALL_MOD_PATH ?= $(DESTDIR)
-export INSTALL_MOD_PATH
+    # Default installation directory within /lib/modules/$(KVER)/
+    # "updates" is often checked by depmod. Override if needed.
+    INSTALL_MOD_DIR ?= updates
+    export INSTALL_MOD_DIR
 
-# This would otherwise default to "extra", which isn't in the depmod
-# configuration on either Arch or Ubuntu.  Both have "updates" though.  You can
-# override by setting this when running make install.
-INSTALL_MOD_DIR ?= updates
-export INSTALL_MOD_DIR
+default: modules
 
-all: modules ;
-
-install: modules_install ;
-
-%:
+# Standard targets for external modules
+modules modules_install clean help %::
 	$(MAKE) -C $(KDIR) M=$(shell pwd) $@
 
 endif
