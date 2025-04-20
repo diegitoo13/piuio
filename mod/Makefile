@@ -1,12 +1,9 @@
-# Basic PIUIO HID driver Makefile
+# PIUIO HID driver Makefile
 
 obj-m         := piuio_hid.o
 
-# Kernel build settings
 KVER          := $(shell uname -r)
 KBUILD_PATH   := /lib/modules/$(KVER)/build
-
-# Installation directory for the module
 MOD_DIR       := /lib/modules/$(KVER)/kernel/drivers/misc
 
 .PHONY: all modules install uninstall clean
