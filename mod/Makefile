@@ -1,26 +1,22 @@
-ifneq ($(KERNELRELEASE),)
-    # Kbuild part of makefile
-    obj-m := piuio_hid.o 
+obj-m := piuio_hid.o
 
-# Building external module
-else
-    # Default to building for the currently running kernel
-    KVER ?= $(shell uname -r)
-    KDIR ?= /lib/modules/$(KVER)/build
+KBUILD_PATH ?= /lib/modules/$(KVER)/build
+KVER := $(shell uname -r)
+MOD_DIR := /lib/modules/$(KVER)/kernel/drivers/misc/
 
-    # If DESTDIR is given, output there for staging (e.g., packaging)
-    INSTALL_MOD_PATH ?= $(DESTDIR)
-    export INSTALL_MOD_PATH
+default:
+	$(MAKE) -C $(KBUILD_PATH) M=$(PWD) modules
 
-    # Default installation directory within /lib/modules/$(KVER)/
-    # "updates" is often checked by depmod. Override if needed.
-    INSTALL_MOD_DIR ?= updates
-    export INSTALL_MOD_DIR
+install:
+	sudo mkdir -p $(MOD_DIR)
+	sudo cp $(PWD)/piuio_hid.ko $(MOD_DIR)
+	sudo depmod -a
+	@echo "Module piuio_hid.ko installed to $(MOD_DIR)"
 
-default: modules
+uninstall:
+	sudo rm -f $(MOD_DIR)/piuio_hid.ko
+	sudo depmod -a
+	@echo "Module piuio_hid.ko uninstalled from $(MOD_DIR)"
 
-# Standard targets for external modules
-modules modules_install clean help %::
-	$(MAKE) -C $(KDIR) M=$(shell pwd) $@
-
-endif
+clean:
+	$(MAKE) -C $(KBUILD_PATH) M=$(PWD) clean
