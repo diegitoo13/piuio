@@ -1,36 +1,33 @@
+# Module object name (e.g., piuio_hid.o if your C file is piuio_hid.c)
 obj-m         := piuio_hid.o
 
+# Kernel version/directories (allow overrides via command line)
 KVER          ?= $(shell uname -r)
-KBUILD_PATH   := /lib/modules/$(KVER)/build
-MOD_DIR       := /lib/modules/$(KVER)/kernel/drivers/misc
+KDIR          ?= /lib/modules/$(KVER)/build
+PWD           := $(shell pwd)
 
-.PHONY: all modules install uninstall clean prepare-headers
+# Subdirectory within /lib/modules/$(KVER)/ for installation (e.g., "updates", "extra")
+INSTALL_MOD_DIR ?= updates
+export INSTALL_MOD_DIR
 
+# Phony targets
+.PHONY: all modules clean install uninstall modules_install
+
+# Default target
 all: modules
 
-prepare-headers:
-	# --- TAB --- below!
-	$(MAKE) -C $(KBUILD_PATH) scripts
+# Delegate build, clean, and Kbuild's install to the kernel build system
+modules clean modules_install: %:
+	# --- TAB --- below! Ensure Tab indentation!
+	$(MAKE) -C "$(KDIR)" M="$(PWD)" $@
 
-modules: prepare-headers
-	# --- TAB --- below!
-	$(MAKE) -C $(KBUILD_PATH) M=$(PWD) modules
+# Use Kbuild's 'modules_install' for the install step
+install: modules_install
 
-install: modules
-	# --- TAB --- below!
-	sudo mkdir -p $(MOD_DIR)
-	# --- TAB --- below!
-	sudo cp piuio_hid.ko $(MOD_DIR)
-	# --- TAB --- below!
-	sudo depmod -a
-
+# Uninstall requires manual removal
 uninstall:
-	# --- TAB --- below!
-	sudo rm -f $(MOD_DIR)/piuio_hid.ko
-	# --- TAB --- below!
+	# --- TAB --- below! Ensure Tab indentation!
+	sudo rm -f "/lib/modules/$(KVER)/$(INSTALL_MOD_DIR)/$(obj-m:.o=.ko)"
+	# --- TAB --- below! Ensure Tab indentation!
 	sudo depmod -a
-
-clean:
-	# --- TAB --- below!
-	$(MAKE) -C $(KBUILD_PATH) M=$(PWD) clean
 
