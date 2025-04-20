@@ -8,29 +8,33 @@ on:
 
 jobs:
   smoke-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install kernel headers
+      - name: Install generic kernel headers
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-headers-$(uname -r)
+          sudo apt-get install -y linux-headers-generic
+
+      - name: Set kernel version
+        id: set-kver
+        run: echo "KVER=$(ls /lib/modules | grep -v azure | head -n1)" >> $GITHUB_ENV
 
       - name: Build module
         working-directory: mod
-        run: make
+        run: make KVER=$KVER
 
       - name: Smoke-test install
         working-directory: mod
         run: |
-          sudo make install
+          sudo make KVER=$KVER install
           lsmod | grep piuio_hid
 
       - name: Smoke-test uninstall
         working-directory: mod
         run: |
-          sudo make uninstall
+          sudo make KVER=$KVER uninstall
           ! lsmod | grep piuio_hid
