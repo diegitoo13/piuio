@@ -1,4 +1,4 @@
-name: C/C++ CI
+name: Build & smoke‑test PIUIO
 
 on:
   push:
@@ -7,22 +7,28 @@ on:
     branches: [ "master" ]
 
 jobs:
-  build:
+  smoke-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # Install kernel headers so `make modules` works
       - name: Install kernel headers
-        run: sudo apt-get update && sudo apt-get install -y linux-headers-$(uname -r)
-
-      - name: Build PIUIO module
-        working-directory: mod
-        run: make -C /lib/modules/$(uname -r)/build M=$PWD modules
-
-
-      - name: Run self‑tests
         run: |
-          make check || true
-          make distcheck || true
+          sudo apt-get update
+          sudo apt-get install -y linux-headers-$(uname -r)
 
+      - name: Build module
+        run: make modules
+
+      - name: Smoke‑test install
+        run: |
+          sudo make install
+          # ensure the ko shows up
+          lsmod | grep piuio_hid
+
+      - name: Smoke‑test uninstall
+        run: |
+          sudo make uninstall
+          # ensure grep returns non-zero (i.e. module is gone)
+          ! lsmod | grep piuio_hid
