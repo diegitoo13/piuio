@@ -2,7 +2,9 @@
 #define _PIUIO_HID_H
 
 #include <linux/hid.h>          // Basic HID types
+#ifdef CONFIG_LEDS_CLASS // Only include if LED support is configured
 #include <linux/leds.h>         // struct led_classdev
+#endif
 #include <linux/spinlock_types.h>// spinlock_t
 #include <linux/miscdevice.h>   // struct miscdevice
 #include <linux/usb.h>          // struct usb_device, struct urb
@@ -12,7 +14,7 @@
 #include <linux/mutex.h>        // struct mutex
 #include <linux/workqueue.h>    // struct work_struct
 #include <linux/atomic.h>       // atomic_t
-#include <linux/device.h>       // Required for misc_get/set_drvdata prototypes?
+#include <linux/device.h>       // Required for dev_get/set_drvdata prototypes
 
 /* Device and protocol definitions */
 #define USB_VENDOR_ID_BTNBOARD          0x0d2f
@@ -25,7 +27,9 @@
 #define PIUIO_OUTPUT_CHUNK       16   // Size of data chunk for legacy output SET_REPORTs
 #define PIUIO_LEGACY_SIZE        8    // Expected size for legacy /dev/piuio0 writes
 #define PIUIO_NUM_INPUTS         48   // Max number of inputs expected across supported devices
+#ifdef CONFIG_LEDS_CLASS // Only define if LED support is configured
 #define PIUIO_MAX_LEDS           48   // Max number of LEDs expected across supported devices
+#endif
 
 // Input report size for the NEW (1020) device (based on python/descriptor)
 #define PIUIO_INPUT_SIZE_NEW     16
@@ -52,6 +56,7 @@
 #define HID_REQ_SET_REPORT              0x09
 #endif
 
+#ifdef CONFIG_LEDS_CLASS // Wrap LED specific structs/defs
 // Forward declaration
 struct piuio;
 
@@ -61,6 +66,7 @@ struct piuio_led {
 	struct led_classdev cdev;
 	u8 idx;
 };
+#endif // CONFIG_LEDS_CLASS
 
 // Structure for legacy output work
 struct piuio_legacy_output_work {
@@ -82,10 +88,12 @@ struct piuio {
 	unsigned long         prev_inputs[BITS_TO_LONGS(PIUIO_NUM_INPUTS)]; // Previous input state
 	struct hrtimer        timer;     // Timer for polling input
 
-	/* Output Handling */
+#ifdef CONFIG_LEDS_CLASS
+	/* Output Handling (LEDs) */
 	u8                    led_shadow[PIUIO_MAX_LEDS]; // Shadow state for LEDs
 	struct piuio_led     *led;          // Array of LED structures (devm allocated)
 	spinlock_t            led_lock;     // Protects led_shadow
+#endif // CONFIG_LEDS_CLASS
 
 	/* Output Handling (Interrupt OUT - 1020) */
 	struct urb           *output_urb;   // URB for Interrupt OUT data (MANUAL alloc/free)
