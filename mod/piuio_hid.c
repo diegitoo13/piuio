@@ -20,11 +20,6 @@
  * Free Software Foundation, version 2.
  */
 
-/*
- * PIUIO HID interface driver
- * ... (Copyright etc.) ...
- */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>     // kzalloc, kfree, kasprintf
