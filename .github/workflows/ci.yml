@@ -7,115 +7,68 @@ on:
     branches: [ "master" ]
 
 jobs:
-  build-and-test-matrix: # Renamed job
+  build-and-test: # Simplified job - no matrix needed for just native kernel
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # === Test against runner's kernel and latest Ubuntu 22.04 HWE kernel ===
-        kernel-headers-package:
-          - linux-headers-generic         # Headers for the kernel the runner is using
-          - linux-headers-generic-hwe-22.04 # Latest HWE kernel headers for Ubuntu 22.04 LTS
-        # Add more specific, available packages here if needed
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install build dependencies and Native Headers
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential kmod libelf-dev
+          # Install essential tools AND the headers matching the runner's current kernel
+          sudo apt-get install -y build-essential kmod libelf-dev linux-headers-generic
 
-      - name: Install specific kernel headers (${{ matrix.kernel-headers-package }})
+      - name: Build PIUIO module for Native Kernel ($(uname -r))
+        working-directory: mod # Assumes Makefile is in 'mod' subdirectory
         run: |
-          echo "Attempting to install ${{ matrix.kernel-headers-package }}"
-          sudo apt-get install -y -o Debug::pkgProblemResolver=yes ${{ matrix.kernel-headers-package }}
+          # Determine the kernel directory reliably using the running kernel version
+          KVER=$(uname -r)
+          KDIR="/lib/modules/$KVER/build"
 
-      - name: Determine Kernel Version and Build Directory
-        id: find_kdir
-        run: |
-          HEADER_PKG="${{ matrix.kernel-headers-package }}"
-          KDIR=""
-          KV=""
-          echo "Determining KDIR/KV for package: $HEADER_PKG"
-          if [[ "$HEADER_PKG" == "linux-headers-generic" ]]; then
-            KV=$(uname -r)
-            echo "Package is generic, using runner's kernel version: $KV"
-            if [[ -L "/lib/modules/$KV/build" || -d "/lib/modules/$KV/build" ]]; then
-                KDIR="/lib/modules/$KV/build"
-            elif [[ -d "/usr/src/linux-headers-$KV" ]]; then
-                 KDIR="/usr/src/linux-headers-$KV"
-            else
-                echo "::error::Could not find build directory for runner's generic kernel $KV"
-                ls -l /lib/modules/ /usr/src/ || true
-                exit 1
-            fi
-          else
-            SEARCH_PATTERN="linux-headers-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic"
-            echo "Searching for installed HWE headers matching pattern: $SEARCH_PATTERN"
-            FOUND_LIB_MODULES=$(ls -d /lib/modules/*-generic/build 2>/dev/null | grep -E "$SEARCH_PATTERN" | sort -V | tail -n 1)
-            FOUND_USR_SRC=$(ls -d /usr/src/linux-headers-*-generic 2>/dev/null | grep -E "$SEARCH_PATTERN" | sort -V | tail -n 1)
-            if [[ -n "$FOUND_LIB_MODULES" ]] && [[ -L "$FOUND_LIB_MODULES" || -d "$FOUND_LIB_MODULES" ]]; then
-                 KDIR="$FOUND_LIB_MODULES"
-                 KV=$(basename "$(dirname "$KDIR")")
-                 echo "Found HWE KDIR via /lib/modules: $KDIR"
-            elif [[ -n "$FOUND_USR_SRC" ]] && [[ -d "$FOUND_USR_SRC" ]]; then
-                 KDIR="$FOUND_USR_SRC"
-                 KV=$(basename "$KDIR" | sed 's/linux-headers-//')
-                 echo "Found HWE KDIR via /usr/src: $KDIR"
-            else
-                 echo "::error::Could not find installed headers directory for $HEADER_PKG"
-                 echo "Listing /usr/src:" ; ls -l /usr/src || true
-                 echo "Listing /lib/modules:" ; ls -l /lib/modules || true
-                 exit 1
-            fi
-          fi
-          if [[ -n "$KDIR" ]] && { [[ -d "$KDIR" || -L "$KDIR" ]] || [[ -d "$KDIR/build" || -L "$KDIR/build" ]]; }; then
-             echo "Using KDIR: $KDIR"
-             echo "kdir_path=$KDIR" >> $GITHUB_OUTPUT
-             echo "Using Kernel Version: $KV"
-             echo "kernel_version=$KV" >> $GITHUB_OUTPUT
-          else
-             echo "::error::Determined KDIR ($KDIR) is invalid or does not exist."
+          # Verify KDIR exists (it should after installing linux-headers-generic)
+          if [[ ! -L "$KDIR" && ! -d "$KDIR" ]]; then
+             echo "::error::Kernel build directory not found at $KDIR after installing linux-headers-generic."
+             # Provide debug info
+             echo "Kernel version: $KVER"
+             echo "Listing /lib/modules:"
+             ls -l /lib/modules/ || true
+             echo "Listing /usr/src:"
+             ls -l /usr/src/ || true
              exit 1
           fi
 
-      - name: Build PIUIO module for ${{ steps.find_kdir.outputs.kernel_version }}
-        working-directory: mod # Assumes Makefile is in 'mod' subdirectory
-        run: |
-          echo "Building using KDIR: ${{ steps.find_kdir.outputs.kdir_path }}"
-          make -C "${{ steps.find_kdir.outputs.kdir_path }}" M="$PWD" modules
+          echo "Building using KDIR: $KDIR"
+          # Build the module using the determined KDIR
+          make -C "$KDIR" M="$PWD" modules
 
-      # --- New Step: Runtime Load/Unload Test ---
-      - name: Load/Unload Test (Native Kernel Only)
-        # Only run this step if the build used the 'linux-headers-generic' package
-        if: matrix.kernel-headers-package == 'linux-headers-generic'
+      - name: Load/Unload Test (Native Kernel)
         run: |
-          MODULE_PATH="./mod/piuio_hid.ko" # Assuming this is the output path relative to repo root
+          MODULE_PATH="./mod/piuio_hid.ko" # Relative to repo root
 
           if [ ! -f "$MODULE_PATH" ]; then
             echo "::error::Kernel module file not found at $MODULE_PATH"
             exit 1
           fi
 
-          echo "Attempting to load module built for native kernel (${{ steps.find_kdir.outputs.kernel_version }})..."
-          # Use modprobe which handles dependencies, fall back to insmod if needed. Use -v for verbose.
+          echo "Attempting to load module built for native kernel ($(uname -r))..."
+          # Try modprobe first (-v for verbose), then insmod as fallback
           sudo modprobe -v "$MODULE_PATH" || {
             echo "::warning::modprobe failed, attempting insmod...";
             sudo insmod "$MODULE_PATH" || {
               echo "::error::insmod failed";
-              sudo dmesg | tail -n 30; # Show more dmesg on failure
+              sudo dmesg | tail -n 30; # Show dmesg output on failure
               exit 1;
             }
           }
 
           echo "Module loaded. Checking dmesg (last 30 lines)..."
-          sleep 1 # Give dmesg time to potentially update
+          sleep 1 # Short pause for dmesg buffer
           sudo dmesg | tail -n 30
 
           echo "Attempting to unload module (piuio_hid)..."
-          # Use the module name for rmmod
+          # Use module name for rmmod
           sudo rmmod piuio_hid || {
             echo "::error::rmmod failed";
             sudo dmesg | tail -n 30;
@@ -126,4 +79,16 @@ jobs:
           sleep 1
           sudo dmesg | tail -n 30
           echo "Load/Unload test completed successfully."
+
+      # Optional Debug Step (Uncomment to find available headers if you want to add other kernels later)
+      # - name: List available kernel headers (for debugging future matrix additions)
+      #   if: always() # Run even if previous steps fail, or remove 'if' to run always
+      #   run: |
+      #     echo "--- Runner Kernel ---"
+      #     uname -a
+      #     echo "--- Searching for potentially relevant headers ---"
+      #     sudo apt-cache search linux-headers-generic || true
+      #     # Add more specific searches if needed, e.g., for 6.x kernels
+      #     sudo apt-cache search linux-headers-6\. || true
+      #     echo "--- End of search ---"
 
