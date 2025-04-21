@@ -2,93 +2,52 @@ name: Build and Test PIUIO Kernel Module
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master"]
 
 jobs:
-  build-and-test: # Simplified job - no matrix needed for just native kernel
+  build-and-test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        kernel_version:
+          - $(uname -r) # Native kernel
+          - 6.2.0-39-generic
+          - 5.15.0-92-generic
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install build dependencies and Native Headers
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          # Install essential tools AND the headers matching the runner's current kernel
-          sudo apt-get install -y build-essential kmod libelf-dev linux-headers-generic
+          sudo apt-get install -y build-essential kmod libelf-dev sparse linux-source \
+            linux-headers-${{ matrix.kernel_version }}
 
-      - name: Build PIUIO module for Native Kernel ($(uname -r))
-        working-directory: mod # Assumes Makefile is in 'mod' subdirectory
+      - name: Kernel Coding Style Check
         run: |
-          # Determine the kernel directory reliably using the running kernel version
-          KVER=$(uname -r)
-          KDIR="/lib/modules/$KVER/build"
+          cp /usr/src/linux-source-*/scripts/checkpatch.pl .
+          ./checkpatch.pl --strict mod/*.c mod/*.h
 
-          # Verify KDIR exists (it should after installing linux-headers-generic)
-          if [[ ! -L "$KDIR" && ! -d "$KDIR" ]]; then
-             echo "::error::Kernel build directory not found at $KDIR after installing linux-headers-generic."
-             # Provide debug info
-             echo "Kernel version: $KVER"
-             echo "Listing /lib/modules:"
-             ls -l /lib/modules/ || true
-             echo "Listing /usr/src:"
-             ls -l /usr/src/ || true
-             exit 1
-          fi
-
-          echo "Building using KDIR: $KDIR"
-          # Build the module using the determined KDIR
-          make -C "$KDIR" M="$PWD" modules
-
-      - name: Load/Unload Test (Native Kernel)
+      - name: Static Analysis with Sparse
         run: |
-          MODULE_PATH="./mod/piuio_hid.ko" # Relative to repo root
+          make -C /usr/src/linux-headers-${{ matrix.kernel_version }} M="$PWD/mod" C=2 CHECK=sparse modules
 
-          if [ ! -f "$MODULE_PATH" ]; then
-            echo "::error::Kernel module file not found at $MODULE_PATH"
-            exit 1
-          fi
+      - name: Build Module for Kernel ${{ matrix.kernel_version }}
+        working-directory: mod
+        run: |
+          make -C /usr/src/linux-headers-${{ matrix.kernel_version }} M="$PWD" modules
 
-          echo "Attempting to load module built for native kernel ($(uname -r))..."
-          # Try modprobe first (-v for verbose), then insmod as fallback
-          sudo modprobe -v "$MODULE_PATH" || {
-            echo "::warning::modprobe failed, attempting insmod...";
-            sudo insmod "$MODULE_PATH" || {
-              echo "::error::insmod failed";
-              sudo dmesg | tail -n 30; # Show dmesg output on failure
-              exit 1;
-            }
-          }
+      - name: modinfo Sanity Check
+        run: |
+          modinfo ./mod/piuio_hid.ko
 
-          echo "Module loaded. Checking dmesg (last 30 lines)..."
-          sleep 1 # Short pause for dmesg buffer
-          sudo dmesg | tail -n 30
-
-          echo "Attempting to unload module (piuio_hid)..."
-          # Use module name for rmmod
-          sudo rmmod piuio_hid || {
-            echo "::error::rmmod failed";
-            sudo dmesg | tail -n 30;
-            exit 1;
-           }
-
-          echo "Module unloaded. Checking dmesg (last 30 lines)..."
-          sleep 1
-          sudo dmesg | tail -n 30
-          echo "Load/Unload test completed successfully."
-
-      # Optional Debug Step (Uncomment to find available headers if you want to add other kernels later)
-      # - name: List available kernel headers (for debugging future matrix additions)
-      #   if: always() # Run even if previous steps fail, or remove 'if' to run always
-      #   run: |
-      #     echo "--- Runner Kernel ---"
-      #     uname -a
-      #     echo "--- Searching for potentially relevant headers ---"
-      #     sudo apt-cache search linux-headers-generic || true
-      #     # Add more specific searches if needed, e.g., for 6.x kernels
-      #     sudo apt-cache search linux-headers-6\. || true
-      #     echo "--- End of search ---"
+      - name: Load/Unload Test with Error Check (Native kernel only)
+        if: matrix.kernel_version == '$(uname -r)'
+        run: |
+          sudo insmod ./mod/piuio_hid.ko || (sudo dmesg | tail -n50 && exit 1)
+          sleep 2
+          sudo dmesg | tail -n50 | grep -Ei "(BUG|panic|oops|warn|error)" && exit 1 || echo "No critical errors"
+          sudo rmmod piuio_hid
 
