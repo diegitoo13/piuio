@@ -8,22 +8,30 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         kernel_version:
-          - $(uname -r) # Native kernel
+          - native
           - 6.2.0-39-generic
           - 5.15.0-92-generic
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set Kernel Version
+        id: kernel
+        run: |
+          if [ "${{ matrix.kernel_version }}" = "native" ]; then
+            echo "version=$(uname -r)" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ matrix.kernel_version }}" >> $GITHUB_OUTPUT
+          fi
+
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential kmod libelf-dev sparse linux-source \
-            linux-headers-${{ matrix.kernel_version }}
+          sudo apt-get install -y build-essential kmod libelf-dev sparse linux-source linux-headers-${{ steps.kernel.outputs.version }}
 
       - name: Kernel Coding Style Check
         run: |
@@ -32,22 +40,22 @@ jobs:
 
       - name: Static Analysis with Sparse
         run: |
-          make -C /usr/src/linux-headers-${{ matrix.kernel_version }} M="$PWD/mod" C=2 CHECK=sparse modules
+          make -C /usr/src/linux-headers-${{ steps.kernel.outputs.version }} M="$PWD/mod" C=2 CHECK=sparse modules
 
-      - name: Build Module for Kernel ${{ matrix.kernel_version }}
+      - name: Build Module for Kernel ${{ steps.kernel.outputs.version }}
         working-directory: mod
         run: |
-          make -C /usr/src/linux-headers-${{ matrix.kernel_version }} M="$PWD" modules
+          make -C /usr/src/linux-headers-${{ steps.kernel.outputs.version }} M="$PWD" modules
 
       - name: modinfo Sanity Check
         run: |
           modinfo ./mod/piuio_hid.ko
 
       - name: Load/Unload Test with Error Check (Native kernel only)
-        if: matrix.kernel_version == '$(uname -r)'
+        if: matrix.kernel_version == 'native'
         run: |
           sudo insmod ./mod/piuio_hid.ko || (sudo dmesg | tail -n50 && exit 1)
           sleep 2
-          sudo dmesg | tail -n50 | grep -Ei "(BUG|panic|oops|warn|error)" && exit 1 || echo "No critical errors"
+          sudo dmesg | tail -n50 | grep -Ei '(BUG|panic|oops|warn|error)' && exit 1 || echo "No critical errors detected."
           sudo rmmod piuio_hid
-
+          echo "Module loaded and unloaded successfully."
