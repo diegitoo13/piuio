@@ -35,8 +35,10 @@ jobs:
 
       - name: Kernel Coding Style Check
         run: |
-          cp /usr/src/linux-source-*/scripts/checkpatch.pl .
+          sudo apt-get install -y linux-source
+          tar -xf /usr/src/linux-source-*.tar.* --wildcards "*/scripts/checkpatch.pl" --strip-components=2
           ./checkpatch.pl --strict mod/*.c mod/*.h
+
 
       - name: Static Analysis with Sparse
         run: |
