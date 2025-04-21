@@ -673,7 +673,12 @@ static int piuio_probe(struct hid_device *hdev,
 #endif
 	spin_lock_init(&piu->output_submit_lock);
 	atomic_set(&piu->output_active, 0);
-	mutex_init(&piu->legacy_output_mutex);
+#ifdef CONFIG_LEDS_CLASS // --- Wrap mutex init ---
+	// Mutex only needed for legacy LED output workqueue
+	if (id->product == USB_PRODUCT_ID_BTNBOARD_LEGACY) {
+		mutex_init(&piu->legacy_output_mutex);
+	}
+#endif // --- End wrap ---
 
 	// --- Find Interrupt OUT Endpoint (for 1020 output) ---
 	for (i = 0; i < intf->cur_altsetting->desc.bNumEndpoints; i++) {
@@ -771,11 +776,8 @@ static int piuio_probe(struct hid_device *hdev,
             hid_warn(hdev, "Interrupt OUT endpoint 0x%02x found, expected 0x%02x for 1020 device LED output.\n",
                      ep_out->bEndpointAddress, PIUIO_INT_OUT_EP);
         }
-		// Setup URB/buffer even if EP seems wrong or LEDs disabled,
-		// as it might be used for other purposes (though currently only used for LEDs)
-		// Buffer allocation uses devm_
+		// Setup URB/buffer even if EP seems wrong or LEDs disabled
 		piu->output_buf = devm_kzalloc(&hdev->dev, PIUIO_OUTPUT_SIZE_NEW, GFP_KERNEL);
-		// URB allocation is manual, needs manual free
 		piu->output_urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (!piu->output_buf || !piu->output_urb) {
 			hid_err(hdev, "Failed to allocate output URB/buffer\n");
@@ -787,14 +789,11 @@ static int piuio_probe(struct hid_device *hdev,
 			goto err_unregister_input; // Otherwise just unregister input
 			#endif
 		}
-		// Only set pipe if endpoint was found
-		if (ep_out) {
+		if (ep_out) { // Only set pipe if endpoint was found
 			piu->output_pipe = usb_sndintpipe(piu->udev, ep_out->bEndpointAddress);
 			hid_info(hdev, "Allocated URB %p and buffer %p for Interrupt OUT EP 0x%02x\n",
 					 piu->output_urb, piu->output_buf, ep_out->bEndpointAddress);
 		} else {
-			// Mark pipe as invalid? Or rely on check in send function?
-			// For now, rely on check in send function (piuio_send_output_interrupt validates piu->output_pipe implicitly via usb_fill_int_urb usage)
 			hid_warn(hdev, "Output URB/buffer allocated, but no valid endpoint found.\n");
 		}
 	}
@@ -802,42 +801,39 @@ static int piuio_probe(struct hid_device *hdev,
 	// --- Setup Workqueue for Legacy Output (1010) ---
 #ifdef CONFIG_LEDS_CLASS // Only needed for legacy LED output
 	if (id->product == USB_PRODUCT_ID_BTNBOARD_LEGACY) {
-		// Workqueue allocation needs manual destroy
 		piu->legacy_output_wq = alloc_ordered_workqueue("piuio_legacy_output", WQ_MEM_RECLAIM);
 		if (!piu->legacy_output_wq) {
 			hid_err(hdev, "Failed to allocate legacy output workqueue\n");
 			ret = -ENOMEM;
-			goto err_free_output_urb; // Free URB if allocated
+			goto err_free_output_urb;
 		}
 		hid_info(hdev, "Allocated workqueue for legacy output\n");
 	}
 #endif // CONFIG_LEDS_CLASS
 
 	// --- Start HID Hardware Layer (Requesting only HIDRAW connection) ---
-	// --- FIXED FLAGS based on user report ---
-	ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
+	ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW); // Using HIDRAW only now
 	if (ret) {
 		hid_err(hdev, "hid_hw_start failed with HID_CONNECT_HIDRAW: %d\n", ret);
 		// Jump to appropriate cleanup based on what succeeded before this
 		#ifdef CONFIG_LEDS_CLASS
-		if (piu->legacy_output_wq) goto err_destroy_workqueue;
+		if (piu->legacy_output_wq) goto err_destroy_workqueue; // If WQ allocated, destroy it
 		#endif
-		if (piu->output_urb) goto err_free_output_urb;
+		if (piu->output_urb) goto err_free_output_urb; // If URB allocated, free it
 		#ifdef CONFIG_LEDS_CLASS
-		goto err_unregister_leds;
+		goto err_unregister_leds; // If LEDs registered, unregister them
 		#else
-		goto err_unregister_input;
+		goto err_unregister_input; // Otherwise just unregister input
 		#endif
 	}
 	hid_info(hdev, "hid_hw_start successful with HID_CONNECT_HIDRAW");
 
 
 	// --- Parse HID Reports (Optional but good practice) ---
-	// This might be less relevant/useful with HID_CONNECT_HIDRAW only, but harmless
 	ret = hid_parse(hdev);
 	if (ret) {
 		hid_err(hdev, "hid_parse failed: %d\n", ret);
-		goto err_stop_hid; // Stop HID HW
+		goto err_stop_hid;
 	}
 	hid_info(hdev, "hid_parse successful");
 
@@ -845,12 +841,11 @@ static int piuio_probe(struct hid_device *hdev,
 	ret = hid_hw_open(hdev);
 	if (ret) {
 		hid_err(hdev, "hid_hw_open failed: %d\n", ret);
-		goto err_stop_hid; // Stop HID HW
+		goto err_stop_hid;
 	}
 	hid_info(hdev, "hid_hw_open successful");
 
 	// --- Send SET_IDLE Request (Required by 1020) ---
-	// We can still send HID class requests even with HID_CONNECT_HIDRAW
 	ret = usb_control_msg(piu->udev,
 						  usb_sndctrlpipe(piu->udev, 0),
 						  HID_REQ_SET_IDLE,
@@ -861,10 +856,10 @@ static int piuio_probe(struct hid_device *hdev,
 						  msecs_to_jiffies(100));
 	if (ret < 0 && ret != -EPIPE) {
 		hid_warn(hdev, "SET_IDLE failed: %d (continuing)\n", ret);
-		ret = 0; // Don't fail probe because of this
+		ret = 0;
 	} else {
 		hid_info(hdev, "SET_IDLE sent successfully (or stalled)\n");
-		ret = 0; // Ensure success path continues
+		ret = 0;
 	}
 
 
@@ -877,11 +872,11 @@ static int piuio_probe(struct hid_device *hdev,
 
 	// --- Misc device setup (/dev/piuioX) - REGISTER LAST ---
 	piu->misc.minor = MISC_DYNAMIC_MINOR;
-	piu->misc_name = devm_kasprintf(&hdev->dev, GFP_KERNEL, "piuio-%s", dev_name(&hdev->dev)); // Uses devm_
+	piu->misc_name = devm_kasprintf(&hdev->dev, GFP_KERNEL, "piuio-%s", dev_name(&hdev->dev));
 	if (!piu->misc_name) {
 		hid_err(hdev, "Failed to allocate misc device name string\n");
 		ret = -ENOMEM;
-		goto err_cancel_timer; // Cancel timer
+		goto err_cancel_timer;
 	}
 	piu->misc.name = piu->misc_name;
 	piu->misc.fops = &piuio_fops;
@@ -891,10 +886,8 @@ static int piuio_probe(struct hid_device *hdev,
 	ret = misc_register(&piu->misc);
 	if (ret) {
 		hid_err(hdev, "Failed to register misc device '%s': %d\n", piu->misc.name, ret);
-		// devm_* handles misc_name cleanup
 		goto err_cancel_timer;
 	}
-	// Associate piu struct with the misc device using the underlying device data function
 	dev_set_drvdata(piu->misc.this_device, piu);
 	hid_info(hdev, "Registered misc device /dev/%s\n", piu->misc.name);
 
@@ -904,20 +897,20 @@ static int piuio_probe(struct hid_device *hdev,
 /* --- Error Handling Cleanup: Unwind in reverse order --- */
 err_cancel_timer:
 	hrtimer_cancel(&piu->timer);
-// err_close_hid: // Now handled by err_stop_hid
 err_stop_hid:
 	hid_hw_close(hdev); // Close HID if open
 	hid_hw_stop(hdev);
-err_destroy_workqueue:
-#ifdef CONFIG_LEDS_CLASS
+#ifdef CONFIG_LEDS_CLASS // Wrap label definition
+err_destroy_workqueue: // Label used by hid_hw_start failure path
 	if (piu->legacy_output_wq)
 		destroy_workqueue(piu->legacy_output_wq); // Manual cleanup
+	// Fall through
 #endif
-err_free_output_urb: // Label used by legacy WQ alloc failure & URB alloc failure
+err_free_output_urb: // Label used by WQ alloc failure & URB alloc failure & hid_hw_start failure
 	usb_free_urb(piu->output_urb);
 	// devm_* handles output_buf
-#ifdef CONFIG_LEDS_CLASS
-err_unregister_leds: // Label used by LED registration failure path
+#ifdef CONFIG_LEDS_CLASS // Wrap label definition and code
+err_unregister_leds: // Label used by LED registration & URB alloc & hid_hw_start failures
 	hid_info(hdev, "Unregistering %d LEDs due to probe error\n", registered_leds);
 	for (i = 0; i < registered_leds; i++) {
 		if (piu->led && piu->led[i].cdev.name) {
@@ -926,7 +919,7 @@ err_unregister_leds: // Label used by LED registration failure path
 	}
 	// Fall through to unregister input device if needed
 #endif
-err_unregister_input: // Label used by LED alloc failure path (if LEDs enabled) or URB alloc (if LEDs disabled)
+err_unregister_input: // Label used by LED alloc & URB alloc & hid_hw_start failures
 	if (piu->idev) {
 		input_unregister_device(piu->idev); // Manual unregister for input dev
 	}
@@ -1053,6 +1046,5 @@ module_hid_driver(piuio_driver);
 
 // Module Metadata
 MODULE_AUTHOR("Diego Acevedo");
-MODULE_DESCRIPTION("PIUIO HID interface driver (using polling input, LED support conditional)");
+MODULE_DESCRIPTION("PIUIO HID interface driver (using polling input");
 MODULE_LICENSE("GPL v2");
-
