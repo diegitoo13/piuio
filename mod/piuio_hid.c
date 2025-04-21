@@ -528,7 +528,7 @@ static ssize_t piuio_dev_write(struct file *filp,
 	struct miscdevice *misc = filp->private_data;
 	// Retrieve the associated piu struct using the underlying device data function
 	// Assuming this_device is a pointer in this kernel version
-	struct piuio *piu = dev_get_drvdata(misc->this_device); // <-- FIXED (Removed &)
+	struct piuio *piu = dev_get_drvdata(misc->this_device);
 	const size_t legacy_bits = PIUIO_LEGACY_SIZE * 8;
 	u8 *tmp = NULL;
 	int pin, ret = 0;
@@ -728,6 +728,9 @@ static int piuio_probe(struct hid_device *hdev,
 		}
 		piu->led[i].cdev.brightness_set_blocking = piuio_led_set;
 		piu->led[i].cdev.max_brightness = 1;
+		// --- Explicitly clear flags before registration ---
+		piu->led[i].cdev.flags = 0; // <-- FIXED
+		// --------------------------------------------------
 		ret = devm_led_classdev_register(&hdev->dev, &piu->led[i].cdev);
 		if (ret) {
 			hid_err(hdev, "Failed to register LED %d (%s): %d\n", i, piu->led[i].cdev.name, ret);
@@ -735,6 +738,7 @@ static int piuio_probe(struct hid_device *hdev,
 		}
 	}
 	hid_info(hdev, "Registered %d LED class devices", PIUIO_MAX_LEDS);
+
 
 	// --- Setup for Interrupt OUT URB (Required for 1020 output) ---
 	if (id->product == USB_PRODUCT_ID_BTNBOARD_NEW) {
@@ -837,7 +841,7 @@ static int piuio_probe(struct hid_device *hdev,
 	}
 	// Associate piu struct with the misc device using the underlying device data function
 	// Assuming this_device is a pointer in this kernel version
-	dev_set_drvdata(piu->misc.this_device, piu); // <-- FIXED (Removed &)
+	dev_set_drvdata(piu->misc.this_device, piu);
 	hid_info(hdev, "Registered misc device /dev/%s\n", piu->misc.name);
 
 	hid_info(hdev, "PIUIO HID Driver probe completed successfully for /dev/%s\n", piu->misc.name);
@@ -857,8 +861,10 @@ err_free_output_urb:
 	usb_free_urb(piu->output_urb);
 	// devm_* handles output_buf
 err_unregister_input:
-	input_unregister_device(piu->idev); // Manual cleanup
-	// devm_* handles LEDs, led names
+	// devm_led_classdev_unregister is implicitly called for registered LEDs
+	// but we still need to unregister the input device manually
+	input_unregister_device(piu->idev);
+	// devm_* handles LEDs structures, led names, output_buf, misc_name
 err_free_piu:
 	// devm_kzalloc handles piu struct freeing
 	hid_info(hdev, "PIUIO HID Driver probe failed (%d)\n", ret);
@@ -879,7 +885,15 @@ static void piuio_remove(struct hid_device *hdev)
 		return;
 	}
 
-	hid_info(hdev, "Unregistering PIUIO HID Driver for %s\n", piu->misc.name ? piu->misc.name : dev_name(&hdev->dev));
+	// Check if misc name was allocated before trying to use it in log
+	if (piu->misc.name) {
+		hid_info(hdev, "Unregistering PIUIO HID Driver for %s (/dev/%s)\n",
+		         dev_name(&hdev->dev), piu->misc.name);
+	} else {
+	    hid_info(hdev, "Unregistering PIUIO HID Driver for %s (misc name unknown)\n",
+	             dev_name(&hdev->dev));
+	}
+
 
 	// 1. Deregister misc device first
 	// Check if misc name was allocated before trying to use it in log
@@ -922,10 +936,20 @@ static void piuio_remove(struct hid_device *hdev)
 	hid_hw_stop(hdev);
 	hid_info(hdev, "HID hardware stopped.");
 
-	// 6. Remaining resources (input device, LEDs, output_buf, misc_name, piu struct)
-	//    are cleaned up automatically by the devm_* framework.
+	// 6. Remaining resources are cleaned up automatically by the devm_* framework:
+	//    - Input device (devm_input_allocate_device)
+	//    - LED class devices (devm_led_classdev_register)
+	//    - LED structures (devm_kcalloc)
+	//    - LED names (devm_kasprintf)
+	//    - Output buffer (devm_kzalloc)
+	//    - Misc device name (devm_kasprintf)
+	//    - Main piu struct (devm_kzalloc)
+	//    NOTE: Input device needs manual unregister before devm cleanup if registration succeeded.
+	//          This is handled in the probe error path 'err_unregister_input'.
+	//          In the remove path, devm handles the registered input device implicitly
+	//          after hid_hw_stop/close potentially, but relying on devm is safer.
 
-	hid_info(hdev, "PIUIO HID Driver remove finished.\n");
+	hid_info(hdev, "PIUIO HID Driver remove finished for %s.\n", dev_name(&hdev->dev));
 }
 
 // --- ID Table Includes Both Devices ---
