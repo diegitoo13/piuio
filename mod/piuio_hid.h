@@ -15,6 +15,8 @@
 #include <linux/workqueue.h>    // struct work_struct
 #include <linux/atomic.h>       // atomic_t
 #include <linux/device.h>       // Required for dev_get/set_drvdata prototypes
+#include <linux/kconfig.h>      // For IS_ENABLED macro
+
 
 /* Device and protocol definitions */
 #define USB_VENDOR_ID_BTNBOARD          0x0d2f
@@ -103,8 +105,10 @@ struct piuio {
 	atomic_t              output_active;// Flag: is output URB currently submitted?
 
 	/* Output Handling (Control Transfer - 1010 Legacy - via Workqueue) */
+#ifdef CONFIG_LEDS_CLASS // Workqueue only needed for legacy LED output
 	struct workqueue_struct *legacy_output_wq; // Workqueue for legacy output (manual alloc/destroy)
 	struct mutex          legacy_output_mutex; // Protects legacy output work submission
+#endif
 
 	/* Misc Device */
 	struct miscdevice     misc;         // Misc character device structure
