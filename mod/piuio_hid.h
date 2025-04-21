@@ -2,7 +2,7 @@
 #define _PIUIO_HID_H
 
 #include <linux/hid.h>          // Basic HID types
-#ifdef CONFIG_LEDS_CLASS // Only include if LED support is configured
+#ifdef CONFIG_LEDS_CLASS
 #include <linux/leds.h>         // struct led_classdev
 #endif
 #include <linux/spinlock_types.h>// spinlock_t
@@ -23,24 +23,26 @@
 #define USB_PRODUCT_ID_BTNBOARD_LEGACY  0x1010 // Original/Legacy device ID
 #define USB_PRODUCT_ID_BTNBOARD_NEW     0x1020 // New device ID (verified)
 
-// Report IDs/sizes
-#define PIUIO_INPUT_REPORT_ID    0x01 // Report ID for input (from GET_REPORT wValue 0x0301)
-#define PIUIO_RPT_OUT_BASE       0x80 // Base Report ID for legacy output control SET_REPORTs
-#define PIUIO_OUTPUT_CHUNK       16   // Size of data chunk for legacy output SET_REPORTs
-#define PIUIO_LEGACY_SIZE        8    // Expected size for legacy /dev/piuio0 writes
-#define PIUIO_NUM_INPUTS         48   // Max number of inputs expected across supported devices
-#ifdef CONFIG_LEDS_CLASS // Only define if LED support is configured
-#define PIUIO_MAX_LEDS           48   // Max number of LEDs expected across supported devices
+// Report IDs/sizes - UPDATED based on report
+#define PIUIO_INPUT_REPORT_ID    0x30 // Report ID for input (GET_REPORT 0x0130) - WAS 0x01
+#define PIUIO_OUTPUT_REPORT_ID   0x13 // Report ID for output/feature (SET_REPORT 0x0313 / Interrupt OUT) - NEW
+// #define PIUIO_RPT_OUT_BASE       0x80 // Legacy output base - REMOVED
+// #define PIUIO_OUTPUT_CHUNK       16   // Legacy output chunk size - REMOVED
+#define PIUIO_LEGACY_SIZE        8    // Expected size for legacy /dev/piuio0 writes (Keep for miscdev?)
+
+#define PIUIO_NUM_INPUTS         48   // Max number of inputs assumed (affects keycode mapping)
+#ifdef CONFIG_LEDS_CLASS
+#define PIUIO_MAX_LEDS           48   // Max number of LEDs assumed
 #endif
 
-// Input report size for the NEW (1020) device (based on python/descriptor)
-#define PIUIO_INPUT_SIZE_NEW     16
-// Buffer size for GET_REPORT poll (needs space for report + potential overhead)
-#define PIUIO_INPUT_BUF_SIZE     (PIUIO_INPUT_SIZE_NEW + 2)
-// Output report size for the NEW (1020) device (based on descriptor/logs)
+// Input report size for the NEW (1020) device - UPDATED
+#define PIUIO_INPUT_SIZE_NEW     32   // WAS 16
+// Buffer size for GET_REPORT poll - UPDATED
+#define PIUIO_INPUT_BUF_SIZE     (PIUIO_INPUT_SIZE_NEW + 2) // Allow space for ID? Report says 32 bytes total returned. Let's allocate 34.
+// Output report size for the NEW (1020) device - Matches report
 #define PIUIO_OUTPUT_SIZE_NEW    16
 
-// Endpoint Addresses (from device descriptor analysis - informational)
+// Endpoint Addresses
 #define PIUIO_INT_OUT_EP         0x02 // Interrupt OUT endpoint address for 1020
 
 // Input keycode mapping ranges
@@ -70,12 +72,8 @@ struct piuio_led {
 };
 #endif // CONFIG_LEDS_CLASS
 
-// Structure for legacy output work
-struct piuio_legacy_output_work {
-	struct work_struct work;
-	struct piuio *piu;
-	u8 report_id;
-};
+// Structure for legacy output work - REMOVED
+// struct piuio_legacy_output_work { ... };
 
 // Main Device Structure
 struct piuio {
@@ -87,7 +85,8 @@ struct piuio {
 
 	/* Input Handling (Polling GET_REPORT) */
 	u8                    in_buf[PIUIO_INPUT_BUF_SIZE]; // Buffer for polling input
-	unsigned long         prev_inputs[BITS_TO_LONGS(PIUIO_NUM_INPUTS)]; // Previous input state
+	// Removed prev_inputs as hid_input_report handles state
+	// unsigned long         prev_inputs[BITS_TO_LONGS(PIUIO_NUM_INPUTS)];
 	struct hrtimer        timer;     // Timer for polling input
 
 #ifdef CONFIG_LEDS_CLASS
@@ -104,11 +103,9 @@ struct piuio {
 	spinlock_t            output_submit_lock; // Protects output URB submission state
 	atomic_t              output_active;// Flag: is output URB currently submitted?
 
-	/* Output Handling (Control Transfer - 1010 Legacy - via Workqueue) */
-#ifdef CONFIG_LEDS_CLASS // Workqueue only needed for legacy LED output
-	struct workqueue_struct *legacy_output_wq; // Workqueue for legacy output (manual alloc/destroy)
-	struct mutex          legacy_output_mutex; // Protects legacy output work submission
-#endif
+	/* Output Handling (Control Transfer - 1010 Legacy - via Workqueue) - REMOVED */
+	// struct workqueue_struct *legacy_output_wq;
+	// struct mutex          legacy_output_mutex;
 
 	/* Misc Device */
 	struct miscdevice     misc;         // Misc character device structure
