@@ -823,16 +823,15 @@ static int piuio_probe(struct hid_device *hdev,
 	piu->misc.fops = &piuio_fops;
 	piu->misc.parent = &hdev->dev;
 
-	// Register misc device (needs manual deregistration on failure/remove)
-	ret = misc_register(&piu->misc);
-	if (ret) {
-		hid_err(hdev, "Failed to register misc device '%s': %d\n", piu->misc.name, ret);
-		goto err_cancel_timer; // devm_* handles misc_name
-	}
-	// Use misc_set_drvdata to associate piu struct with misc device
-	misc_set_drvdata(&piu->misc, piu);
-	hid_info(hdev, "Registered misc device /dev/%s\n", piu->misc.name);
-
+ // Register misc device (needs manual deregistration on failure/remove)
+ ret = misc_register(&piu->misc);
+ if (ret) {
+        hid_err(hdev, "Failed to register misc device '%s': %d\n", piu->misc.name, ret);
+        goto err_cancel_timer; // devm_* handles misc_name
+ }
+ // Associate piu struct with the misc device using the underlying device data function
+ dev_set_drvdata(&piu->misc.this_device, piu);
+ hid_info(hdev, "Registered misc device /dev/%s\n", piu->misc.name);
 	hid_info(hdev, "PIUIO HID Driver probe completed successfully for /dev/%s\n", piu->misc.name);
 	return 0; // Success!
 
