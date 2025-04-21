@@ -527,7 +527,8 @@ static ssize_t piuio_dev_write(struct file *filp,
 	// Get misc device struct from file pointer
 	struct miscdevice *misc = filp->private_data;
 	// Retrieve the associated piu struct using the underlying device data function
-	struct piuio *piu = dev_get_drvdata(&misc->this_device); // <-- FIXED
+	// Assuming this_device is a pointer in this kernel version
+	struct piuio *piu = dev_get_drvdata(misc->this_device); // <-- FIXED (Removed &)
 	const size_t legacy_bits = PIUIO_LEGACY_SIZE * 8;
 	u8 *tmp = NULL;
 	int pin, ret = 0;
@@ -535,8 +536,8 @@ static ssize_t piuio_dev_write(struct file *filp,
 	unsigned long flags;
 
 	// Check misc first, as piu depends on it being valid
-	if (!misc) {
-		pr_err("piuio: Invalid misc device data in dev_write (filp->private_data is NULL)\n");
+	if (!misc || !misc->this_device) { // Also check if the this_device pointer is valid
+		pr_err("piuio: Invalid misc device data in dev_write (filp->private_data or this_device is NULL)\n");
 		return -ENODEV;
 	}
 	// Check piu and associated hid device
@@ -835,7 +836,8 @@ static int piuio_probe(struct hid_device *hdev,
 		goto err_cancel_timer; // devm_* handles misc_name
 	}
 	// Associate piu struct with the misc device using the underlying device data function
-	dev_set_drvdata(&piu->misc.this_device, piu); // <-- CORRECT USAGE
+	// Assuming this_device is a pointer in this kernel version
+	dev_set_drvdata(piu->misc.this_device, piu); // <-- FIXED (Removed &)
 	hid_info(hdev, "Registered misc device /dev/%s\n", piu->misc.name);
 
 	hid_info(hdev, "PIUIO HID Driver probe completed successfully for /dev/%s\n", piu->misc.name);
@@ -880,9 +882,15 @@ static void piuio_remove(struct hid_device *hdev)
 	hid_info(hdev, "Unregistering PIUIO HID Driver for %s\n", piu->misc.name ? piu->misc.name : dev_name(&hdev->dev));
 
 	// 1. Deregister misc device first
-	hid_info(hdev, "Deregistering misc device /dev/%s...", piu->misc.name);
+	// Check if misc name was allocated before trying to use it in log
+	if (piu->misc.name) {
+		hid_info(hdev, "Deregistering misc device /dev/%s...", piu->misc.name);
+	} else {
+		hid_info(hdev, "Deregistering misc device (name unknown)...");
+	}
 	misc_deregister(&piu->misc);
 	hid_info(hdev, "Misc device deregistered.");
+
 
 	// 2. Cancel timer
 	hid_info(hdev, "Cancelling input timer...");
