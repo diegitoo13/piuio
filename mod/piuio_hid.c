@@ -23,7 +23,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>     // kzalloc, kfree, kasprintf
-#ifdef CONFIG_LEDS_CLASS // Only include if LED support is configured
+#ifdef CONFIG_LEDS_CLASS
 #include <linux/leds.h>     // LED framework
 #endif
 #include <linux/input.h>    // Input subsystem
@@ -67,29 +67,199 @@ static inline int piuio_keycode(unsigned pin)
 	return PIUIO_BTN_EXTRA + (pin - (BTN_GAMEPAD - BTN_JOYSTICK));
 }
 
-// --- Input functions (piuio_get_input_report, piuio_process_polled_input, piuio_timer_cb) ---
-// --- remain unchanged as they don't directly use LED APIs ---
-// (Paste existing functions here)
-static int piuio_get_input_report(struct piuio *piu, u8 *buffer, size_t buf_len); // Declaration if needed
-static void piuio_process_polled_input(struct piuio *piu, u8 *data, int size); // Declaration if needed
-static enum hrtimer_restart piuio_timer_cb(struct hrtimer *timer); // Declaration if needed
+/**
+ * piuio_get_input_report - Poll device for input using GET_REPORT control transfer.
+ * @piu: Device instance data.
+ * @buffer: Buffer to store the received report data.
+ * @buf_len: Size of the provided buffer.
+ *
+ * Uses GET_REPORT (Input Report ID 1) based on logs/python script.
+ *
+ * Return: Number of bytes received on success, negative error code otherwise.
+ */
+// --- RESTORED FUNCTION DEFINITION ---
+static int piuio_get_input_report(struct piuio *piu, u8 *buffer, size_t buf_len)
+{
+	int ret;
+
+	// Basic null check
+	if (!piu || !piu->udev || !piu->hdev || !buffer) {
+		pr_err("piuio: Invalid arguments to piuio_get_input_report\n");
+		return -EINVAL;
+	}
+
+	// Parameters from logs/python: reqType=0xA1, req=1, val=0x0301, idx=iface
+	ret = usb_control_msg(
+		piu->udev,
+		usb_rcvctrlpipe(piu->udev, 0),
+		HID_REQ_GET_REPORT, // 0x01
+		USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE, // 0xA1
+		(HID_INPUT_REPORT << 8) | PIUIO_INPUT_REPORT_ID, // wValue (Report Type = Input | Report ID = 1)
+		piu->iface, // wIndex (Interface)
+		buffer,     // data buffer
+		buf_len,    // max length to read
+		msecs_to_jiffies(50)); // Short timeout for polling
+
+	if (ret < 0 && ret != -ESHUTDOWN && ret != -ENODEV && ret != -EPIPE && ret != -ETIMEDOUT) {
+		 // Log errors other than expected disconnect/stall/timeout conditions
+		 hid_warn(piu->hdev, "GET_REPORT failed: %d\n", ret);
+	}
+
+	return ret; // Return bytes read or error
+}
+
+/**
+ * piuio_process_polled_input - Process a received input report buffer.
+ * @piu: Device instance data.
+ * @data: Buffer containing the received report data.
+ * @size: Actual size of the data received.
+ *
+ * Parses input data based on Product ID and reports changes.
+ * Format for 1020 is assumed 16 bytes, sequential bits, 0=pressed.
+ * Format for 1010 is unknown and ignored.
+ */
+// --- RESTORED FUNCTION DEFINITION ---
+static void piuio_process_polled_input(struct piuio *piu, u8 *data, int size)
+{
+	int i, max_inputs_in_report = 0;
+	int inputs_to_process = 0;
+	int num_longs = 0;
+	bool state_changed = false;
+	const unsigned long *current_data_bits = NULL;
+	int bit_index;
+
+	// Check pointers passed from timer callback
+	if (!piu || !piu->idev || !data) {
+		pr_err("piuio: Invalid state/data in process_polled_input\n");
+		return;
+	}
+
+	// Handle input based on device type
+	if (piu->hdev->product == USB_PRODUCT_ID_BTNBOARD_NEW) { // 1020
+		if (size != PIUIO_INPUT_SIZE_NEW) {
+			hid_dbg(piu->hdev, "Ignoring polled input report with size %d (expected %d)\n",
+					size, PIUIO_INPUT_SIZE_NEW);
+			return;
+		}
+		// Assume 16 bytes received contain the input bits directly, no offset.
+		current_data_bits = (unsigned long *)data;
+		max_inputs_in_report = size * 8; // 128 bits
+		hid_dbg(piu->hdev, "Processing polled 1020 input (%d bytes)\n", size);
+
+	} else if (piu->hdev->product == USB_PRODUCT_ID_BTNBOARD_LEGACY) { // 1010
+		// Input format for legacy device is unknown/unsupported
+		hid_warn_once(piu->hdev, "Ignoring polled input for legacy device %04X:%04X (size %d) - format unknown\n",
+					  piu->hdev->vendor, piu->hdev->product, size);
+		return;
+	} else {
+		// Should not happen
+		hid_warn_once(piu->hdev, "Ignoring polled input for unknown device %04X:%04X\n",
+					  piu->hdev->vendor, piu->hdev->product);
+		return;
+	}
+
+	// Limit processing based on report size and defined max inputs
+	inputs_to_process = min(max_inputs_in_report, PIUIO_NUM_INPUTS);
+	num_longs = BITS_TO_LONGS(inputs_to_process);
+
+	hid_dbg(piu->hdev, "Comparing %d input bits (%d longs)\n", inputs_to_process, num_longs);
+
+	// Compare current state with previous state and report changes
+	for (i = 0; i < num_longs; i++) {
+		// Check if the current long index is valid within the received data size
+		if ((i + 1) * sizeof(unsigned long) > size) {
+			hid_warn(piu->hdev, "Bounds check failed reading input state (long %d, size %d)\n", i, size);
+			break; // Stop processing longs
+		}
+		unsigned long current_bits = current_data_bits[i];
+		unsigned long changed_bits = current_bits ^ piu->prev_inputs[i];
+
+		if (changed_bits != 0) {
+			hid_dbg(piu->hdev, "Input change detected in long %d (changed=0x%lx)\n", i, changed_bits);
+			state_changed = true;
+			for_each_set_bit(bit_index, &changed_bits, BITS_PER_LONG) {
+				int global_bit_index = i * BITS_PER_LONG + bit_index;
+				if (global_bit_index >= inputs_to_process)
+					break;
+
+				// Assumes 0 = pressed / bit cleared
+				bool pressed = !test_bit(global_bit_index, current_data_bits);
+				hid_dbg(piu->hdev, "Input bit %d changed to %d\n", global_bit_index, pressed);
+
+				// Report event to input subsystem
+				input_event(piu->idev, EV_MSC, MSC_SCAN, global_bit_index + 1);
+				input_report_key(piu->idev, piuio_keycode(global_bit_index), pressed);
+			}
+			piu->prev_inputs[i] = current_bits; // Update previous state
+		}
+	}
+
+	// Sync input state if changes occurred
+	if (state_changed) {
+		hid_dbg(piu->hdev, "Sending input_sync\n");
+		input_sync(piu->idev);
+	}
+}
 
 
-// --- Legacy Output Work (1010 device) ---
+/**
+ * piuio_timer_cb - Timer callback function for polling input reports.
+ * @timer: Pointer to the hrtimer structure.
+ *
+ * Polls the device using GET_REPORT control transfer and processes the result.
+ *
+ * Return: HRTIMER_RESTART to reschedule the timer.
+ */
+// --- RESTORED FUNCTION DEFINITION ---
+static enum hrtimer_restart piuio_timer_cb(struct hrtimer *timer)
+{
+	struct piuio *piu = container_of(timer, struct piuio, timer);
+	int size;
+
+	// Check critical pointers
+	if (!piu || !piu->hdev || !piu->idev || !piu->udev) {
+		pr_err("piuio: Invalid state in timer callback (piu=%p)\n", piu);
+		return HRTIMER_NORESTART; // Stop timer
+	}
+
+	size = piuio_get_input_report(piu, piu->in_buf, PIUIO_INPUT_BUF_SIZE);
+
+	if (size >= 0) {
+		// Process if data was received successfully
+		piuio_process_polled_input(piu, piu->in_buf, size);
+	} else {
+		// Error occurred during polling
+		if (size == -ENODEV || size == -ESHUTDOWN) {
+			hid_info(piu->hdev, "Device disconnected, stopping timer.\n");
+			return HRTIMER_NORESTART; // Stop timer if device gone
+		}
+		// Continue polling despite other transient errors (e.g., -EPIPE, -ETIMEDOUT)
+		hid_dbg(piu->hdev, "Polling failed with error %d, continuing timer.\n", size);
+	}
+
+	// Reschedule the timer for the next poll
+	hrtimer_forward_now(timer, ms_to_ktime(poll_interval_ms));
+	return HRTIMER_RESTART;
+}
+
+
+#ifdef CONFIG_LEDS_CLASS // --- Wrap LED related functions ---
+/**
+ * piuio_set_report_legacy_ctrl_work - Work function for legacy output (runs in process context).
+ * @work: Pointer to the work_struct.
+ *
+ * Sends a SET_REPORT control transfer for the legacy 0x1010 device.
+ */
 static void piuio_set_report_legacy_ctrl_work(struct work_struct *work)
 {
 	struct piuio_legacy_output_work *output_work =
 		container_of(work, struct piuio_legacy_output_work, work);
 	struct piuio *piu = output_work->piu;
 	u8 rptid = output_work->report_id;
-#ifdef CONFIG_LEDS_CLASS // LED related calculation
 	int bank = rptid - PIUIO_RPT_OUT_BASE;
-#endif
-	u8 *buf;
-	int i, ret;
-#ifdef CONFIG_LEDS_CLASS // LED related lock/state
-	unsigned long flags;
-#endif
+	u8 *buf; // Used only here
+	int i, ret; // Used only here
+	unsigned long flags; // Used only here
 
 	// Check piu and associated device pointers
 	if (!piu || !piu->hdev || !piu->udev) {
@@ -97,13 +267,6 @@ static void piuio_set_report_legacy_ctrl_work(struct work_struct *work)
 		kfree(output_work); // Free work struct if state invalid
 		return;
 	}
-
-#ifndef CONFIG_LEDS_CLASS
-	// If LEDs disabled, this function has nothing to do for legacy output
-	hid_warn_once(piu->hdev, "Legacy output work skipped (CONFIG_LEDS_CLASS disabled)\n");
-	kfree(output_work);
-	return;
-#else
 
 	hid_dbg(piu->hdev, "Sending SET_REPORT(ctrl) for ID 0x%02x (bank %d) via workqueue\n", rptid, bank);
 
@@ -147,12 +310,20 @@ static void piuio_set_report_legacy_ctrl_work(struct work_struct *work)
 	} else {
 		hid_dbg(piu->hdev, "SET_REPORT(ctrl) for ID 0x%02x successful\n", rptid);
 	}
-#endif // CONFIG_LEDS_CLASS
 }
 
+/**
+ * piuio_queue_legacy_output_work - Queue work to send legacy output report.
+ * @piu: Device instance data.
+ * @rptid: Report ID to send.
+ *
+ * Allocates and queues a work item to send a SET_REPORT control transfer.
+ * Uses a mutex to prevent flooding the workqueue.
+ *
+ * Return: 0 on success or if busy, negative error code on failure.
+ */
 static int piuio_queue_legacy_output_work(struct piuio *piu, u8 rptid)
 {
-#ifdef CONFIG_LEDS_CLASS
 	struct piuio_legacy_output_work *output_work;
 
 	// Check piu and required workqueue pointer
@@ -190,18 +361,17 @@ static int piuio_queue_legacy_output_work(struct piuio *piu, u8 rptid)
 	}
 
 	return 0; // Success
-#else
-    // No legacy LED output if LEDs disabled
-    return -EOPNOTSUPP;
-#endif // CONFIG_LEDS_CLASS
 }
 
-// --- Interrupt Output Handling (1020 device) ---
+/**
+ * piuio_output_report_interrupt_complete - Completion handler for interrupt OUT URB.
+ * @urb: The completed URB.
+ */
 static void piuio_output_report_interrupt_complete(struct urb *urb)
 {
 	struct piuio *piu = urb->context;
 	int status = urb->status;
-	unsigned long flags;
+	unsigned long flags; // Used by spinlock
 
 	if (!piu) {
 		pr_err("piuio: Invalid context in output URB completion!\n");
@@ -221,14 +391,21 @@ static void piuio_output_report_interrupt_complete(struct urb *urb)
 	}
 }
 
+/**
+ * piuio_send_output_interrupt - Send LED state via Interrupt OUT endpoint (for 1020).
+ * @piu: Device instance data.
+ *
+ * Prepares and submits a 16-byte report reflecting the current led_shadow state
+ * to the Interrupt OUT endpoint (0x02). Uses locking to prevent concurrent submissions.
+ *
+ * Return: 0 on success or if busy, negative error code on failure.
+ */
 static int piuio_send_output_interrupt(struct piuio *piu)
 {
-	int ret = 0;
-	unsigned long flags_submit;
-#ifdef CONFIG_LEDS_CLASS // LED related state/lock
-	int i;
-	unsigned long flags_led;
-#endif
+	int ret = 0; // Used only here
+	int i; // Used only here
+	unsigned long flags_led; // Used only here
+	unsigned long flags_submit; // Used only here
 
 	// Basic validation
 	if (!piu || !piu->output_urb || !piu->output_buf || !piu->udev || !piu->hdev) {
@@ -236,12 +413,6 @@ static int piuio_send_output_interrupt(struct piuio *piu)
 			   piu, piu ? piu->output_urb : NULL, piu ? piu->output_buf : NULL);
 		return -EFAULT;
 	}
-
-#ifndef CONFIG_LEDS_CLASS
-	// If LEDs disabled, this function has nothing to send
-	hid_warn_once(piu->hdev, "Interrupt output skipped (CONFIG_LEDS_CLASS disabled)\n");
-    return -EOPNOTSUPP;
-#else
 
 	hid_dbg(piu->hdev, "Attempting to send Interrupt OUT report\n");
 
@@ -287,11 +458,8 @@ static int piuio_send_output_interrupt(struct piuio *piu)
 	}
 
 	return ret;
-#endif // CONFIG_LEDS_CLASS
 }
 
-
-#ifdef CONFIG_LEDS_CLASS // --- Wrap LED specific callback ---
 /**
  * piuio_led_set - Callback function to set LED brightness.
  * @cdev: LED class device structure.
@@ -304,8 +472,8 @@ static int piuio_led_set(struct led_classdev *cdev,
 {
 	struct piuio_led *ld = container_of(cdev, struct piuio_led, cdev);
 	struct piuio *piu = ld->piu;
-	int ret = -EOPNOTSUPP;
-	unsigned long flags;
+	int ret = -EOPNOTSUPP; // Used only here
+	unsigned long flags; // Used only here
 
 	// Check piu and associated hid device
 	if (!piu || !piu->hdev) {
@@ -355,8 +523,8 @@ static int piuio_led_set(struct led_classdev *cdev,
  * @len: Number of bytes to write (must match PIUIO_LEGACY_SIZE).
  * @off: File offset (ignored).
  *
- * Assumes the written data is a bitmap for the first N LEDs.
- * Updates LEDs using the appropriate method for the device.
+ * Assumes the written data is a bitmap for the first N LEDs (if enabled).
+ * Updates LEDs using the appropriate method for the device (if enabled).
  *
  * Return: Number of bytes written on success, negative error code otherwise.
  */
@@ -367,19 +535,17 @@ static ssize_t piuio_dev_write(struct file *filp,
 	// Get misc device struct from file pointer
 	struct miscdevice *misc = filp->private_data;
 	// Retrieve the associated piu struct using the underlying device data function
-	// Assuming this_device is a pointer in this kernel version
 	struct piuio *piu = dev_get_drvdata(misc->this_device);
-#ifdef CONFIG_LEDS_CLASS
+#ifdef CONFIG_LEDS_CLASS // Variables only needed if LEDs enabled
 	const size_t legacy_bits = PIUIO_LEGACY_SIZE * 8;
 	unsigned long flags;
-#endif
 	u8 *tmp = NULL;
 	int pin, ret = 0;
 	int first_error = 0;
-
+#endif
 
 	// Check misc first, as piu depends on it being valid
-	if (!misc || !misc->this_device) { // Also check if the this_device pointer is valid
+	if (!misc || !misc->this_device) {
 		pr_err("piuio: Invalid misc device data in dev_write (filp->private_data or this_device is NULL)\n");
 		return -ENODEV;
 	}
@@ -390,7 +556,6 @@ static ssize_t piuio_dev_write(struct file *filp,
 		return -ENODEV;
 	}
 
-
 	hid_dbg(piu->hdev, "Write to legacy device /dev/%s, len=%zu\n", piu->misc.name, len);
 
 	// Check for expected legacy write size
@@ -400,14 +565,11 @@ static ssize_t piuio_dev_write(struct file *filp,
 	}
 
 #ifndef CONFIG_LEDS_CLASS
-    // If LEDs disabled, writing to the legacy device doesn't do anything related to LEDs.
-    // We could return an error, or just accept the write as a no-op.
-    // Accepting it might be better for compatibility with apps expecting the device node.
-    hid_warn_once(piu->hdev, "Legacy write ignored (CONFIG_LEDS_CLASS disabled)\n");
+    // If LEDs disabled, accept the write as a no-op for compatibility.
+    hid_warn_once(piu->hdev, "Legacy write accepted but ignored (CONFIG_LEDS_CLASS disabled)\n");
     return len; // Pretend success
 #else
-
-	// Allocate temporary buffer (use GFP_KERNEL, we're in process context)
+	// Allocate temporary buffer
 	tmp = kmalloc(PIUIO_LEGACY_SIZE, GFP_KERNEL);
 	if (!tmp)
 		return -ENOMEM;
@@ -420,11 +582,9 @@ static ssize_t piuio_dev_write(struct file *filp,
 
 	// Update shadow state under lock based on received bitmap
 	spin_lock_irqsave(&piu->led_lock, flags);
-	// Update only the bits corresponding to the legacy interface size
 	for (pin = 0; pin < legacy_bits && pin < PIUIO_MAX_LEDS; pin++) {
 		piu->led_shadow[pin] = !!(tmp[pin / 8] & (1 << (pin % 8)));
 	}
-	// Leave LEDs beyond legacy_bits untouched by this write
 	spin_unlock_irqrestore(&piu->led_lock, flags);
 
 	kfree(tmp); // Free temporary buffer
@@ -437,10 +597,8 @@ static ssize_t piuio_dev_write(struct file *filp,
 			first_error = ret;
 	} else if (piu->hdev->product == USB_PRODUCT_ID_BTNBOARD_LEGACY) { // 1010
 		hid_dbg(piu->hdev, "Updating LEDs via legacy control transfer workqueue due to legacy write\n");
-		// Queue work for each chunk affected by the legacy write
 		for (pin = 0; pin < legacy_bits && pin < PIUIO_MAX_LEDS; pin += PIUIO_OUTPUT_CHUNK) {
 			ret = piuio_queue_legacy_output_work(piu, PIUIO_RPT_OUT_BASE + (pin / PIUIO_OUTPUT_CHUNK));
-			// Report the first error encountered (ignore -EBUSY as it means queued/skipped)
 			if (ret < 0 && first_error == 0 && ret != -EBUSY) {
 				first_error = ret;
 			}
@@ -573,7 +731,7 @@ static int piuio_probe(struct hid_device *hdev,
 	if (!piu->led) {
 		hid_err(hdev, "Failed to allocate LED structures\n");
 		ret = -ENOMEM;
-		goto err_unregister_input; // Manually unregister input device now
+		goto err_unregister_input;
 	}
 	hid_info(hdev, "Allocated %d LED structures", PIUIO_MAX_LEDS);
 
@@ -586,8 +744,8 @@ static int piuio_probe(struct hid_device *hdev,
 		if (!piu->led[i].cdev.name) {
 			hid_err(hdev, "Failed to allocate name for LED %d\n", i);
 			ret = -ENOMEM;
-			registered_leds = i; // Record how many names succeeded
-			goto err_unregister_leds; // Unregister LEDs registered so far
+			registered_leds = i;
+			goto err_unregister_leds;
 		}
 		piu->led[i].cdev.brightness_set_blocking = piuio_led_set;
 		piu->led[i].cdev.max_brightness = 1;
@@ -597,23 +755,22 @@ static int piuio_probe(struct hid_device *hdev,
 		ret = led_classdev_register(&hdev->dev, &piu->led[i].cdev);
 		if (ret) {
 			hid_err(hdev, "Failed to register LED %d (%s): %d\n", i, piu->led[i].cdev.name, ret);
-			registered_leds = i; // Record how many registrations succeeded
+			registered_leds = i;
 			// devm will free the name allocated for this LED
-			goto err_unregister_leds; // Unregister previously successful LEDs
+			goto err_unregister_leds;
 		}
 	}
-	registered_leds = PIUIO_MAX_LEDS; // All LEDs registered successfully
+	registered_leds = PIUIO_MAX_LEDS;
 	hid_info(hdev, "Registered %d LED class devices", registered_leds);
 #endif // CONFIG_LEDS_CLASS
 
 
 	// --- Setup for Interrupt OUT URB (Required for 1020 output) ---
+	// This URB might be used even if LEDs are off, so setup is not conditional
 	if (id->product == USB_PRODUCT_ID_BTNBOARD_NEW) {
-		if (!ep_out) { // Don't need PIUIO_INT_OUT_EP check if LEDS disabled? Maybe keep warn.
+		if (!ep_out) {
 			hid_warn(hdev, "Interrupt OUT endpoint not found for 1020 device.\n");
-			// Continue probe, output might fail later if needed for non-LED reasons
 		} else if (IS_ENABLED(CONFIG_LEDS_CLASS) && ep_out->bEndpointAddress != PIUIO_INT_OUT_EP) {
-            // Only warn about specific EP if LEDs are enabled and EP is wrong
             hid_warn(hdev, "Interrupt OUT endpoint 0x%02x found, expected 0x%02x for 1020 device LED output.\n",
                      ep_out->bEndpointAddress, PIUIO_INT_OUT_EP);
         } else {
@@ -623,7 +780,7 @@ static int piuio_probe(struct hid_device *hdev,
 			piu->output_urb = usb_alloc_urb(0, GFP_KERNEL);
 			if (!piu->output_buf || !piu->output_urb) {
 				hid_err(hdev, "Failed to allocate output URB/buffer\n");
-				usb_free_urb(piu->output_urb); // Free urb if allocated
+				usb_free_urb(piu->output_urb);
 				ret = -ENOMEM;
 				#ifdef CONFIG_LEDS_CLASS
 				goto err_unregister_leds; // Unregister LEDs if enabled
@@ -695,7 +852,7 @@ static int piuio_probe(struct hid_device *hdev,
 
 	// --- Initialize and Start Polling Timer ---
 	hrtimer_init(&piu->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	piu->timer.function = piuio_timer_cb;
+	piu->timer.function = piuio_timer_cb; // This assignment requires piuio_timer_cb definition
 	hrtimer_start(&piu->timer, ms_to_ktime(poll_interval_ms), HRTIMER_MODE_REL);
 	hid_info(hdev, "Started input polling timer (interval %d ms)\n", poll_interval_ms);
 
@@ -720,7 +877,6 @@ static int piuio_probe(struct hid_device *hdev,
 		goto err_cancel_timer;
 	}
 	// Associate piu struct with the misc device using the underlying device data function
-	// Assuming this_device is a pointer in this kernel version
 	dev_set_drvdata(piu->misc.this_device, piu);
 	hid_info(hdev, "Registered misc device /dev/%s\n", piu->misc.name);
 
@@ -728,41 +884,34 @@ static int piuio_probe(struct hid_device *hdev,
 	return 0; // Success!
 
 /* --- Error Handling Cleanup: Unwind in reverse order --- */
-// err_deregister_misc: // Not needed here, misc_register is last
 err_cancel_timer:
 	hrtimer_cancel(&piu->timer);
-// err_close_hid: // Not needed, done in err_stop_hid
 err_stop_hid:
 	hid_hw_close(hdev); // Close HID if open
 	hid_hw_stop(hdev);
 err_destroy_workqueue:
-#ifdef CONFIG_LEDS_CLASS // Only destroy if it could have been created
+#ifdef CONFIG_LEDS_CLASS
 	if (piu->legacy_output_wq)
 		destroy_workqueue(piu->legacy_output_wq); // Manual cleanup
 #endif
-err_free_output_urb:
-	// Free output URB manually if it was allocated
+err_free_output_urb: // Label used by legacy WQ alloc failure path
 	usb_free_urb(piu->output_urb);
-	// devm_* handles output_buf
-#ifdef CONFIG_LEDS_CLASS // Only unregister LEDs if they could have been registered
-err_unregister_leds:
+#ifdef CONFIG_LEDS_CLASS
+err_unregister_leds: // Label used by LED registration failure path
 	hid_info(hdev, "Unregistering %d LEDs due to probe error\n", registered_leds);
-	for (i = 0; i < registered_leds; i++) { // Unregister only those that succeeded registration
-		// Check name as proxy for successful setup/registration before unregistering
+	for (i = 0; i < registered_leds; i++) {
 		if (piu->led && piu->led[i].cdev.name) {
 			led_classdev_unregister(&piu->led[i].cdev);
 		}
 	}
 	// Fall through to unregister input device if needed
 #endif
-err_unregister_input:
-	// Input device registration requires manual unregister if it succeeded
-	// If idev is NULL here, input_register_device was not called or failed before allocation
+err_unregister_input: // Label used by LED alloc failure path
 	if (piu->idev) {
-		input_unregister_device(piu->idev);
+		input_unregister_device(piu->idev); // Manual unregister for input dev
 	}
 	// devm handles LED structures/names (if CONFIG_LEDS_CLASS), input device alloc, etc.
-err_free_piu:
+err_free_piu: // Label used by early failures (udev, idev alloc)
 	// devm_kzalloc handles piu struct freeing automatically
 	hid_info(hdev, "PIUIO HID Driver probe failed (%d)\n", ret);
 	return ret; // Return the error code that caused the failure
@@ -796,9 +945,8 @@ static void piuio_remove(struct hid_device *hdev)
 #ifdef CONFIG_LEDS_CLASS // --- Wrap LED unregistration ---
 	// 1. Unregister LEDs (manual cleanup now required)
 	hid_info(hdev, "Unregistering LED class devices...");
-	if (piu->led) { // Check if LED array was allocated
+	if (piu->led) {
 		for (i = 0; i < PIUIO_MAX_LEDS; i++) {
-			// Check name exists as proxy for successful setup/registration in probe
 			if (piu->led[i].cdev.name) {
 				led_classdev_unregister(&piu->led[i].cdev);
 			}
@@ -808,8 +956,8 @@ static void piuio_remove(struct hid_device *hdev)
 #endif // CONFIG_LEDS_CLASS
 
 
-	// 2. Deregister misc device first (before stopping HID?)
-	if (piu->misc.name) { // Check name exists as proxy for registration
+	// 2. Deregister misc device first
+	if (piu->misc.name) {
 		hid_info(hdev, "Deregistering misc device /dev/%s...", piu->misc.name);
 		misc_deregister(&piu->misc);
 		hid_info(hdev, "Misc device deregistered.");
@@ -831,7 +979,7 @@ static void piuio_remove(struct hid_device *hdev)
 	}
 
 	// 5. Destroy workqueue (if created)
-#ifdef CONFIG_LEDS_CLASS // Only destroy if it could have been created
+#ifdef CONFIG_LEDS_CLASS
 	if (piu->legacy_output_wq) {
 		hid_info(hdev, "Destroying legacy output workqueue...");
 		destroy_workqueue(piu->legacy_output_wq);
@@ -850,7 +998,6 @@ static void piuio_remove(struct hid_device *hdev)
 	hid_info(hdev, "HID hardware stopped.");
 
 	// 7. Unregister input device (manual step if registered)
-	// devm handles allocation, but registration needs manual unregister
 	if (piu->idev) {
 		hid_info(hdev, "Unregistering input device...");
 		input_unregister_device(piu->idev);
@@ -859,11 +1006,7 @@ static void piuio_remove(struct hid_device *hdev)
 	}
 
 
-	// 8. Remaining devm resources are cleaned up automatically:
-	//    - LED structures/names (if CONFIG_LEDS_CLASS)
-	//    - Output buffer
-	//    - Misc device name
-	//    - Main piu struct
+	// 8. Remaining devm resources are cleaned up automatically
 
 	hid_info(hdev, "PIUIO HID Driver remove finished for %s.\n", dev_name(&hdev->dev));
 }
@@ -882,7 +1025,6 @@ static struct hid_driver piuio_driver = {
 	.id_table = piuio_ids,   // Supported device IDs
 	.probe    = piuio_probe, // Probe function
 	.remove   = piuio_remove,// Remove function
-	// Input is handled via timer polling, not HID events
 };
 
 // Register the driver with the HID subsystem
