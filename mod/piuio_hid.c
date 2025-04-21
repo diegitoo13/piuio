@@ -630,6 +630,9 @@ static int piuio_probe(struct hid_device *hdev,
 	struct usb_interface *intf;
 	struct usb_endpoint_descriptor *ep_out = NULL;
 	int i, ret;
+	// --- Add tracking for manual LED unregistration on error ---
+	int registered_leds = 0;
+	// ---------------------------------------------------------
 
 	hid_info(hdev, "Probing PIUIO device %04X:%04X\n", id->vendor, id->product);
 
@@ -653,7 +656,8 @@ static int piuio_probe(struct hid_device *hdev,
 	piu->udev = interface_to_usbdev(intf);
 	if (!piu->udev) { // Check result of interface_to_usbdev
 		hid_err(hdev, "Cannot get USB device\n");
-		return -ENODEV; // devm_kzalloc handles piu cleanup
+		ret = -ENODEV; // Set ret for error path
+		goto err_free_piu; // devm_kzalloc handles piu cleanup
 	}
 	piu->iface = intf->cur_altsetting->desc.bInterfaceNumber;
 	spin_lock_init(&piu->led_lock);
@@ -674,6 +678,7 @@ static int piuio_probe(struct hid_device *hdev,
 
 	// --- Input device setup ---
 	snprintf(piu->phys, sizeof(piu->phys), "%s/input0", hdev->phys);
+	// Use devm_ version for automatic cleanup on failure/remove
 	idev = devm_input_allocate_device(&hdev->dev);
 	if (!idev) {
 		hid_err(hdev, "Failed to allocate input device\n");
@@ -699,45 +704,52 @@ static int piuio_probe(struct hid_device *hdev,
 	set_bit(EV_MSC, idev->evbit);
 	set_bit(MSC_SCAN, idev->mscbit);
 
-	// Register the input device
+	// Register the input device - requires manual unregister on failure
 	ret = input_register_device(idev);
 	if (ret) {
 		hid_err(hdev, "Failed to register input device: %d\n", ret);
+		// input device allocated by devm_ is freed automatically
 		goto err_free_piu;
 	}
 	hid_info(hdev, "Registered input device %s", idev->name);
 
 	// --- LED class device setup ---
+	// led struct allocation and names still use devm for convenience
 	piu->led = devm_kcalloc(&hdev->dev, PIUIO_MAX_LEDS, sizeof(*piu->led), GFP_KERNEL);
 	if (!piu->led) {
 		hid_err(hdev, "Failed to allocate LED structures\n");
 		ret = -ENOMEM;
-		goto err_unregister_input;
+		goto err_unregister_input; // Manually unregister input device now
 	}
 	hid_info(hdev, "Allocated %d LED structures", PIUIO_MAX_LEDS);
 
-	// Register each LED
+	// Register each LED manually
 	for (i = 0; i < PIUIO_MAX_LEDS; i++) {
 		piu->led[i].piu = piu;
 		piu->led[i].idx = i;
+		// Name allocation still uses devm_
 		piu->led[i].cdev.name = devm_kasprintf(&hdev->dev, GFP_KERNEL, "%s::output%u", dev_name(&hdev->dev), i);
 		if (!piu->led[i].cdev.name) {
 			hid_err(hdev, "Failed to allocate name for LED %d\n", i);
 			ret = -ENOMEM;
-			goto err_unregister_input;
+			registered_leds = i; // Record how many name allocations succeeded
+			goto err_unregister_leds; // Unregister LEDs registered so far
 		}
 		piu->led[i].cdev.brightness_set_blocking = piuio_led_set;
 		piu->led[i].cdev.max_brightness = 1;
-		// --- Explicitly clear flags before registration ---
-		piu->led[i].cdev.flags = 0; // <-- FIXED
-		// --------------------------------------------------
-		ret = devm_led_classdev_register(&hdev->dev, &piu->led[i].cdev);
+		piu->led[i].cdev.flags = 0; // Ensure flags are clear
+
+		// Use non-devm registration function
+		ret = led_classdev_register(&hdev->dev, &piu->led[i].cdev);
 		if (ret) {
 			hid_err(hdev, "Failed to register LED %d (%s): %d\n", i, piu->led[i].cdev.name, ret);
-			goto err_unregister_input;
+			// devm_ handles the name string cleanup for this failed LED
+			registered_leds = i; // Record how many registrations succeeded
+			goto err_unregister_leds; // Unregister LEDs registered so far
 		}
 	}
-	hid_info(hdev, "Registered %d LED class devices", PIUIO_MAX_LEDS);
+	registered_leds = PIUIO_MAX_LEDS; // All LEDs registered successfully
+	hid_info(hdev, "Registered %d LED class devices", registered_leds);
 
 
 	// --- Setup for Interrupt OUT URB (Required for 1020 output) ---
@@ -746,15 +758,15 @@ static int piuio_probe(struct hid_device *hdev,
 			hid_warn(hdev, "Interrupt OUT endpoint 0x%02x not found for 1020 device. Output may not work.\n", PIUIO_INT_OUT_EP);
 			// Continue probe, but output might fail later
 		} else {
-			// Allocate buffer (devm) and URB (manual)
+			// Buffer allocation uses devm_
 			piu->output_buf = devm_kzalloc(&hdev->dev, PIUIO_OUTPUT_SIZE_NEW, GFP_KERNEL);
-			// Use usb_alloc_urb (manual free needed)
+			// URB allocation is manual, needs manual free
 			piu->output_urb = usb_alloc_urb(0, GFP_KERNEL);
 			if (!piu->output_buf || !piu->output_urb) {
 				hid_err(hdev, "Failed to allocate output URB/buffer\n");
-				usb_free_urb(piu->output_urb); // Free urb if buf failed or urb failed
+				usb_free_urb(piu->output_urb); // Free urb if allocated
 				ret = -ENOMEM;
-				goto err_unregister_input;
+				goto err_unregister_leds; // Unregister all LEDs
 			}
 			piu->output_pipe = usb_sndintpipe(piu->udev, ep_out->bEndpointAddress);
 			hid_info(hdev, "Allocated URB %p and buffer %p for Interrupt OUT EP 0x%02x\n",
@@ -764,7 +776,7 @@ static int piuio_probe(struct hid_device *hdev,
 
 	// --- Setup Workqueue for Legacy Output (1010) ---
 	if (id->product == USB_PRODUCT_ID_BTNBOARD_LEGACY) {
-		// Allocate workqueue (needs manual destruction)
+		// Workqueue allocation needs manual destroy
 		piu->legacy_output_wq = alloc_ordered_workqueue("piuio_legacy_output", WQ_MEM_RECLAIM);
 		if (!piu->legacy_output_wq) {
 			hid_err(hdev, "Failed to allocate legacy output workqueue\n");
@@ -778,7 +790,7 @@ static int piuio_probe(struct hid_device *hdev,
 	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT & ~HID_CONNECT_HIDINPUT);
 	if (ret) {
 		hid_err(hdev, "hid_hw_start failed: %d\n", ret);
-		goto err_destroy_workqueue;
+		goto err_destroy_workqueue; // Destroy workqueue if created
 	}
 	hid_info(hdev, "hid_hw_start successful");
 
@@ -786,7 +798,7 @@ static int piuio_probe(struct hid_device *hdev,
 	ret = hid_parse(hdev);
 	if (ret) {
 		hid_err(hdev, "hid_parse failed: %d\n", ret);
-		goto err_stop_hid;
+		goto err_stop_hid; // Stop HID HW
 	}
 	hid_info(hdev, "hid_parse successful");
 
@@ -794,7 +806,7 @@ static int piuio_probe(struct hid_device *hdev,
 	ret = hid_hw_open(hdev);
 	if (ret) {
 		hid_err(hdev, "hid_hw_open failed: %d\n", ret);
-		goto err_stop_hid;
+		goto err_stop_hid; // Stop HID HW
 	}
 	hid_info(hdev, "hid_hw_open successful");
 
@@ -810,9 +822,13 @@ static int piuio_probe(struct hid_device *hdev,
 	if (ret < 0 && ret != -EPIPE) {
 		// Log as warning, but continue probe as it might not be strictly required
 		hid_warn(hdev, "SET_IDLE failed: %d (continuing)\n", ret);
+		// Reset ret to 0 so probe doesn't fail just because of SET_IDLE
+		ret = 0;
 	} else {
 		hid_info(hdev, "SET_IDLE sent successfully (or stalled)\n");
+		ret = 0; // Ensure success path continues
 	}
+
 
 	// --- Initialize and Start Polling Timer ---
 	hrtimer_init(&piu->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -823,21 +839,23 @@ static int piuio_probe(struct hid_device *hdev,
 
 	// --- Misc device setup (/dev/piuioX) - REGISTER LAST ---
 	piu->misc.minor = MISC_DYNAMIC_MINOR;
+	// Misc name allocated with devm_
 	piu->misc_name = devm_kasprintf(&hdev->dev, GFP_KERNEL, "piuio-%s", dev_name(&hdev->dev));
 	if (!piu->misc_name) {
 		hid_err(hdev, "Failed to allocate misc device name string\n");
 		ret = -ENOMEM;
-		goto err_cancel_timer; // Cancel timer before cleanup
+		goto err_cancel_timer; // Cancel timer
 	}
 	piu->misc.name = piu->misc_name;
 	piu->misc.fops = &piuio_fops;
 	piu->misc.parent = &hdev->dev;
 
-	// Register misc device (needs manual deregistration on failure/remove)
+	// Register misc device - requires manual deregister
 	ret = misc_register(&piu->misc);
 	if (ret) {
 		hid_err(hdev, "Failed to register misc device '%s': %d\n", piu->misc.name, ret);
-		goto err_cancel_timer; // devm_* handles misc_name
+		// devm_* handles misc_name cleanup
+		goto err_cancel_timer;
 	}
 	// Associate piu struct with the misc device using the underlying device data function
 	// Assuming this_device is a pointer in this kernel version
@@ -848,8 +866,12 @@ static int piuio_probe(struct hid_device *hdev,
 	return 0; // Success!
 
 /* --- Error Handling Cleanup: Unwind in reverse order --- */
+// err_deregister_misc: // No longer needed here, handled in remove
+//	misc_deregister(&piu->misc);
 err_cancel_timer:
 	hrtimer_cancel(&piu->timer);
+// err_close_hid: // No longer needed here, handled in remove
+//	hid_hw_close(hdev);
 err_stop_hid:
 	hid_hw_close(hdev); // Close HID if open
 	hid_hw_stop(hdev);
@@ -860,15 +882,22 @@ err_free_output_urb:
 	// Free output URB manually if it was allocated
 	usb_free_urb(piu->output_urb);
 	// devm_* handles output_buf
+err_unregister_leds:
+	hid_info(hdev, "Unregistering %d LEDs due to probe error\n", registered_leds);
+	for (i = 0; i < registered_leds; i++) { // Unregister only those that succeeded registration
+		if (piu->led && piu->led[i].cdev.name) { // Check if this specific LED was registered
+			led_classdev_unregister(&piu->led[i].cdev);
+		}
+	}
+	// Fall through to unregister input device if needed
 err_unregister_input:
-	// devm_led_classdev_unregister is implicitly called for registered LEDs
-	// but we still need to unregister the input device manually
+	// Input device registration requires manual unregister if it succeeded
 	input_unregister_device(piu->idev);
-	// devm_* handles LEDs structures, led names, output_buf, misc_name
+	// devm handles LED structures, names, input device alloc etc.
 err_free_piu:
-	// devm_kzalloc handles piu struct freeing
+	// devm_kzalloc handles piu struct freeing automatically
 	hid_info(hdev, "PIUIO HID Driver probe failed (%d)\n", ret);
-	return ret;
+	return ret; // Return the error code that caused the failure
 }
 
 
@@ -879,6 +908,7 @@ err_free_piu:
 static void piuio_remove(struct hid_device *hdev)
 {
 	struct piuio *piu = hid_get_drvdata(hdev);
+	int i; // Declare loop variable for LED unregistration
 
 	if (!piu) {
 		hid_warn(hdev, "piuio_remove called with NULL drvdata\n");
@@ -894,40 +924,52 @@ static void piuio_remove(struct hid_device *hdev)
 	             dev_name(&hdev->dev));
 	}
 
-
-	// 1. Deregister misc device first
-	// Check if misc name was allocated before trying to use it in log
-	if (piu->misc.name) {
-		hid_info(hdev, "Deregistering misc device /dev/%s...", piu->misc.name);
-	} else {
-		hid_info(hdev, "Deregistering misc device (name unknown)...");
+	// 1. Unregister LEDs (manual cleanup now required)
+	// This function is only called if probe succeeded, so all LEDs should be registered
+	hid_info(hdev, "Unregistering LED class devices...");
+	if (piu->led) { // Check if LED array was allocated
+		for (i = 0; i < PIUIO_MAX_LEDS; i++) {
+			// Check name exists as proxy for successful setup/registration in probe
+			if (piu->led[i].cdev.name) {
+				led_classdev_unregister(&piu->led[i].cdev);
+			}
+		}
 	}
-	misc_deregister(&piu->misc);
-	hid_info(hdev, "Misc device deregistered.");
+	hid_info(hdev, "LEDs unregistered.");
 
 
-	// 2. Cancel timer
+	// 2. Deregister misc device first (before stopping HID?)
+	if (piu->misc.name) { // Check name exists as proxy for registration
+		hid_info(hdev, "Deregistering misc device /dev/%s...", piu->misc.name);
+		misc_deregister(&piu->misc);
+		hid_info(hdev, "Misc device deregistered.");
+	}
+
+
+	// 3. Cancel timer
 	hid_info(hdev, "Cancelling input timer...");
 	hrtimer_cancel(&piu->timer);
 	hid_info(hdev, "Input timer cancelled.");
 
-	// 3. Kill pending output URB and free it
+	// 4. Kill pending output URB and free it
 	if (piu->output_urb) {
 		hid_info(hdev, "Killing and freeing output URB %p...", piu->output_urb);
 		usb_kill_urb(piu->output_urb);
 		// Free the manually allocated output URB
 		usb_free_urb(piu->output_urb);
+		piu->output_urb = NULL; // Avoid double free if remove called again
 		hid_info(hdev, "Output URB killed and freed.");
 	}
 
-	// 4. Destroy workqueue (if created)
+	// 5. Destroy workqueue (if created)
 	if (piu->legacy_output_wq) {
 		hid_info(hdev, "Destroying legacy output workqueue...");
 		destroy_workqueue(piu->legacy_output_wq);
+		piu->legacy_output_wq = NULL; // Avoid double destroy
 		hid_info(hdev, "Workqueue destroyed.");
 	}
 
-	// 5. Close and stop HID hardware layer
+	// 6. Close and stop HID hardware layer
 	hid_info(hdev, "Closing HID hardware...");
 	hid_hw_close(hdev);
 	hid_info(hdev, "HID hardware closed.");
@@ -936,18 +978,24 @@ static void piuio_remove(struct hid_device *hdev)
 	hid_hw_stop(hdev);
 	hid_info(hdev, "HID hardware stopped.");
 
-	// 6. Remaining resources are cleaned up automatically by the devm_* framework:
-	//    - Input device (devm_input_allocate_device)
-	//    - LED class devices (devm_led_classdev_register)
+	// 7. Unregister input device (manual step if registered)
+	// Note: devm handles the allocation, but registration needs manual unregister.
+	// This is implicitly handled by the framework on device removal after probe success?
+	// To be safe, explicitly unregister if piu->idev exists.
+	if (piu->idev) {
+		hid_info(hdev, "Unregistering input device...");
+		input_unregister_device(piu->idev);
+		piu->idev = NULL; // Mark as unregistered
+		hid_info(hdev, "Input device unregistered.");
+	}
+
+
+	// 8. Remaining resources are cleaned up automatically by the devm_* framework:
 	//    - LED structures (devm_kcalloc)
 	//    - LED names (devm_kasprintf)
 	//    - Output buffer (devm_kzalloc)
 	//    - Misc device name (devm_kasprintf)
 	//    - Main piu struct (devm_kzalloc)
-	//    NOTE: Input device needs manual unregister before devm cleanup if registration succeeded.
-	//          This is handled in the probe error path 'err_unregister_input'.
-	//          In the remove path, devm handles the registered input device implicitly
-	//          after hid_hw_stop/close potentially, but relying on devm is safer.
 
 	hid_info(hdev, "PIUIO HID Driver remove finished for %s.\n", dev_name(&hdev->dev));
 }
@@ -976,3 +1024,4 @@ module_hid_driver(piuio_driver);
 MODULE_AUTHOR("Diego Acevedo");
 MODULE_DESCRIPTION("PIUIO HID interface driver");
 MODULE_LICENSE("GPL v2");
+
