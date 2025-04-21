@@ -12,6 +12,7 @@
 #include <linux/mutex.h>        // struct mutex
 #include <linux/workqueue.h>    // struct work_struct
 #include <linux/atomic.h>       // atomic_t
+#include <linux/device.h>       // Required for misc_get/set_drvdata prototypes?
 
 /* Device and protocol definitions */
 #define USB_VENDOR_ID_BTNBOARD          0x0d2f
@@ -28,15 +29,12 @@
 
 // Input report size for the NEW (1020) device (based on python/descriptor)
 #define PIUIO_INPUT_SIZE_NEW     16
-#define PIUIO_INPUT_BUF_SIZE     (PIUIO_INPUT_SIZE_NEW + 2) // Buffer for GET_REPORT poll
-// Assume legacy device might use a larger size (Original value, needs verification)
-#define PIUIO_INPUT_SIZE_LEGACY  258
-
-// Output report size for the NEW (1020) device based on descriptor and logs
+// Buffer size for GET_REPORT poll (needs space for report + potential overhead)
+#define PIUIO_INPUT_BUF_SIZE     (PIUIO_INPUT_SIZE_NEW + 2)
+// Output report size for the NEW (1020) device (based on descriptor/logs)
 #define PIUIO_OUTPUT_SIZE_NEW    16
 
 // Endpoint Addresses (from device descriptor analysis - informational)
-#define PIUIO_INT_IN_EP          0x81 // Interrupt IN endpoint address for 1020
 #define PIUIO_INT_OUT_EP         0x02 // Interrupt OUT endpoint address for 1020
 
 // Input keycode mapping ranges
@@ -90,7 +88,7 @@ struct piuio {
 	spinlock_t            led_lock;     // Protects led_shadow
 
 	/* Output Handling (Interrupt OUT - 1020) */
-	struct urb           *output_urb;   // URB for Interrupt OUT data (devm allocated)
+	struct urb           *output_urb;   // URB for Interrupt OUT data (MANUAL alloc/free)
 	u8                   *output_buf;   // Buffer for Interrupt OUT data (devm allocated)
 	unsigned int          output_pipe;  // Pipe for Interrupt OUT
 	spinlock_t            output_submit_lock; // Protects output URB submission state
