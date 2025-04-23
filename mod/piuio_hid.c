@@ -3,103 +3,98 @@
  * PIUIO HID interface driver – unified support for 0x1010 (legacy) and
  * 0x1020 (new) button-board revisions.
  *
- * For 0x1020 the host must poll the device with GET_REPORT (ID 0x30, 32 B).
- * We schedule the poll from an hrtimer but perform the USB transfer itself
- * in a work-queue so we never sleep in hard-IRQ context (fixes “freeze on
- * plug-in” observed on some systems).
+ * 0x1020 is *fully polled*: host issues HID GET_REPORT 0x30/32 B to read
+ * the input matrix.  The board never pushes that report, so we schedule a
+ * high-rate hrtimer and do the control transfer itself from a work-queue
+ * (never from hard-IRQ context).
  *
- * The interrupt-OUT endpoint (report 0x13, 16 B) is used for LEDs / mux etc.
- * Older 0x1010 boards lack that endpoint; writes are ignored for them.
+ * A single HID SET_IDLE(0) is sent once at probe – some 0x1020 firmwares
+ * won’t answer GET_REPORT until the idle timer is cleared.
  *
  * Copyright (C) 2012-2014 Devin J. Pohly  <djpohly+linux@gmail.com>
- * Copyright (C) 2025        Diego Acevedo <diego.acevedo.fernando@gmail.com>
+ * Copyright (C) 2025      Diego Acevedo   <diego.acevedo.fernando@gmail.com>
  */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
-#ifdef CONFIG_LEDS_CLASS
-#include <linux/leds.h>
-#endif
 #include <linux/input.h>
 #include <linux/usb.h>
 #include <linux/hid.h>
 #include <linux/miscdevice.h>
-#include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/spinlock.h>
-#include <linux/bitops.h>
-#include <linux/string.h>
-#include <linux/jiffies.h>
 #include <linux/hrtimer.h>
-#include <linux/ktime.h>
-#include <linux/atomic.h>
-#include <linux/device.h>
-#include <linux/poll.h>
-#include <linux/workqueue.h>		/* new */
-#include <linux/byteorder/generic.h>
+#include <linux/workqueue.h>
+#include <linux/leds.h>
 
 #include "piuio_hid.h"
 
-/* ------------------------------------------------------------------------- */
-/*                       module parameters / helpers                         */
-/* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/*                   module parameters / helpers                      */
+/* ------------------------------------------------------------------ */
 
-static int poll_interval_ms = 4;	/* default 250 Hz */
+static int poll_interval_ms = 4;			/* 250 Hz default */
 module_param(poll_interval_ms, int, 0444);
 MODULE_PARM_DESC(poll_interval_ms,
-	"Polling interval in milliseconds for input reports (1–1000)");
+		 "Polling interval in milliseconds (1–1000)");
 
 static inline int clamped_poll_interval(void)
 {
 	return clamp_val(poll_interval_ms, 1, 1000);
 }
 
-/* only one board is present per cabinet – block a second bind               */
+/* only one board at a time (cabinet limitation) */
 static atomic_t piuio_device_count = ATOMIC_INIT(0);
 
-/* ------------------------------------------------------------------------- */
-/*            global poll work (only one board at a time is allowed)         */
-/* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/*             global poll work – only one board is active            */
+/* ------------------------------------------------------------------ */
 
-static struct work_struct piuio_poll_work;
-static struct piuio      *piuio_poll_ctx;
+static struct work_struct piuio_poll_work;	/* actual worker */
+static struct piuio      *piuio_poll_ctx;	/* board owning the worker */
 
-/* forward declaration of work function */
 static void piuio_do_poll(struct work_struct *w);
 
-/* ------------------------------------------------------------------------- */
-/*                       forward declarations (local)                        */
-/* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/*               forward declarations & local helpers                 */
+/* ------------------------------------------------------------------ */
 
 static enum hrtimer_restart piuio_timer_cb(struct hrtimer *);
+
 #ifdef CONFIG_LEDS_CLASS
-static int  piuio_queue_output(struct piuio *);
 static int  piuio_led_set(struct led_classdev *, enum led_brightness);
+static int  piuio_queue_output(struct piuio *);
 #endif
 
-/* ------------------------------------------------------------------------- */
-/*                           USB helpers – input                             */
-/* ------------------------------------------------------------------------- */
+/* Small helper: SET_IDLE(duration=0, report-id=0) ------------------- */
+static int piuio_set_idle(struct piuio *piu)
+{
+	return usb_control_msg(piu->udev, usb_sndctrlpipe(piu->udev, 0),
+			       HID_REQ_SET_IDLE,
+			       USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+			       0 /* duration=0, id=0 */, piu->iface,
+			       NULL, 0, msecs_to_jiffies(50));
+}
+
+/* ------------------------------------------------------------------ */
+/*                     USB helpers – input polling                    */
+/* ------------------------------------------------------------------ */
 
 static int piuio_get_input_report(struct piuio *piu)
 {
-	const u8  report_id  = PIUIO_INPUT_REPORT_ID;	/* 0x30 */
-	const u16 report_len = PIUIO_INPUT_SIZE_NEW;	/* 32 B */
-	const u16 wValue     = (HID_INPUT_REPORT << 8) | report_id;
-	int ret;
+	const u8  id  = PIUIO_INPUT_REPORT_ID;		/* 0x30 */
+	const u16 len = PIUIO_INPUT_SIZE_NEW;		/* 32 B */
+	const u16 wValue = (HID_INPUT_REPORT << 8) | id;
 
-	ret = usb_control_msg(piu->udev, usb_rcvctrlpipe(piu->udev, 0),
-			      HID_REQ_GET_REPORT,
-			      USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-			      wValue, piu->iface,
-			      piu->in_buf, report_len,
-			      msecs_to_jiffies(50));
+	int ret = usb_control_msg(piu->udev, usb_rcvctrlpipe(piu->udev, 0),
+				  HID_REQ_GET_REPORT,
+				  USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+				  wValue, piu->iface,
+				  piu->in_buf, len, msecs_to_jiffies(50));
 	if (ret < 0)
 		return ret;
-	if (ret != report_len)
-		return -EIO;
-	return 0;
+	return (ret == len) ? 0 : -EIO;
 }
 
 static void piuio_send_keys(struct piuio *piu)
@@ -108,16 +103,18 @@ static void piuio_send_keys(struct piuio *piu)
 	int i;
 
 	for (i = 0; i < PIUIO_NUM_INPUTS; ++i) {
-		int  code    = piuio_keycode(i);
-		bool pressed = piu->in_buf[(i >> 3) + 1] & BIT(i & 7);
-		input_report_key(idev, code, pressed);
+		const int  code    = piuio_keycode(i);
+		const bool pressed = piu->in_buf[(i >> 3) + 1] & BIT(i & 7);
+
+		if (code > 0)
+			input_report_key(idev, code, pressed);
 	}
 	input_sync(idev);
 }
 
-/* ------------------------------------------------------------------------- */
-/*                    poll timer  (hard-IRQ context)                         */
-/* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/*                         poll – timer + worker                      */
+/* ------------------------------------------------------------------ */
 
 static enum hrtimer_restart piuio_timer_cb(struct hrtimer *t)
 {
@@ -130,10 +127,6 @@ static enum hrtimer_restart piuio_timer_cb(struct hrtimer *t)
 	return atomic_read(&piu->shutting_down) ? HRTIMER_NORESTART
 						: HRTIMER_RESTART;
 }
-
-/* ------------------------------------------------------------------------- */
-/*                    poll work  (sleepable context)                         */
-/* ------------------------------------------------------------------------- */
 
 static void piuio_do_poll(struct work_struct *w)
 {
@@ -148,11 +141,10 @@ static void piuio_do_poll(struct work_struct *w)
 		piuio_send_keys(piu);
 }
 
-/* ------------------------------------------------------------------------- */
-/*                         LED / output support                              */
-/* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/*                    LED / output (0x1020 only)                      */
+/* ------------------------------------------------------------------ */
 #ifdef CONFIG_LEDS_CLASS
-
 static void piuio_out_complete(struct urb *urb)
 {
 	struct piuio *piu = urb->context;
@@ -170,7 +162,7 @@ static int piuio_queue_output(struct piuio *piu)
 	int i, ret;
 
 	if (!piu->out_urb)
-		return 0;			/* legacy board – ignore */
+		return 0;				/* legacy board */
 
 	spin_lock_irqsave(&piu->out_lock, flags);
 	if (atomic_read(&piu->out_active)) {
@@ -181,7 +173,7 @@ static int piuio_queue_output(struct piuio *piu)
 	spin_unlock_irqrestore(&piu->out_lock, flags);
 
 	memset(piu->out_buf, 0, PIUIO_OUTPUT_SIZE_NEW);
-	piu->out_buf[0] = PIUIO_OUTPUT_REPORT_ID;	/* 0x13 */
+	piu->out_buf[0] = PIUIO_OUTPUT_REPORT_ID;
 
 	spin_lock_irqsave(&piu->led_lock, flags);
 	for (i = 0; i < PIUIO_MAX_LEDS; ++i)
@@ -196,28 +188,28 @@ static int piuio_queue_output(struct piuio *piu)
 	ret = usb_submit_urb(piu->out_urb, GFP_ATOMIC);
 	if (ret) {
 		atomic_set(&piu->out_active, 0);
-		hid_err(piu->hdev, "usb_submit_urb() failed: %d\n", ret);
+		hid_err(piu->hdev, "usb_submit_urb failed %d\n", ret);
 	}
 	return ret;
 }
 
-static int piuio_led_set(struct led_classdev *cdev, enum led_brightness val)
+static int piuio_led_set(struct led_classdev *cdev, enum led_brightness br)
 {
 	struct piuio_led *ld  = container_of(cdev, struct piuio_led, cdev);
 	struct piuio     *piu = ld->parent;
 	unsigned long flags;
 
 	spin_lock_irqsave(&piu->led_lock, flags);
-	piu->led_shadow[ld->idx] = !!val;
+	piu->led_shadow[ld->idx] = (br != 0);
 	spin_unlock_irqrestore(&piu->led_lock, flags);
 
 	return piuio_queue_output(piu);
 }
 #endif /* CONFIG_LEDS_CLASS */
 
-/* ------------------------------------------------------------------------- */
-/*                misc-device (legacy /dev/piuioX) write handler             */
-/* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/*                misc (/dev/piuioX) – legacy output path             */
+/* ------------------------------------------------------------------ */
 
 static ssize_t piuio_misc_write(struct file *f, const char __user *ubuf,
 				size_t len, loff_t *ppos)
@@ -234,7 +226,7 @@ static ssize_t piuio_misc_write(struct file *f, const char __user *ubuf,
 		return -EINVAL;
 
 #ifndef CONFIG_LEDS_CLASS
-	return len;				/* outputs unsupported – NOP */
+	return len;			/* ignored on builds w/o LED support */
 #else
 	if (copy_from_user(tmp, ubuf, len))
 		return -EFAULT;
@@ -256,9 +248,9 @@ static const struct file_operations piuio_misc_fops = {
 	.llseek = no_llseek,
 };
 
-/* ------------------------------------------------------------------------- */
-/*                                probe                                      */
-/* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/*                              probe                                 */
+/* ------------------------------------------------------------------ */
 
 static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
@@ -278,13 +270,13 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	intf = to_usb_interface(hdev->dev.parent);
 	if (!intf) {
 		ret = -ENODEV;
-		goto err_count;
+		goto err_dec;
 	}
 
 	piu = devm_kzalloc(&hdev->dev, sizeof(*piu), GFP_KERNEL);
 	if (!piu) {
 		ret = -ENOMEM;
-		goto err_count;
+		goto err_dec;
 	}
 
 	hid_set_drvdata(hdev, piu);
@@ -292,14 +284,14 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	piu->udev  = interface_to_usbdev(intf);
 	piu->iface = intf->cur_altsetting->desc.bInterfaceNumber;
 
-	atomic_set(&piu->shutting_down, 0);
 	spin_lock_init(&piu->out_lock);
 	atomic_set(&piu->out_active, 0);
 #ifdef CONFIG_LEDS_CLASS
 	spin_lock_init(&piu->led_lock);
 #endif
+	atomic_set(&piu->shutting_down, 0);
 
-	/* locate interrupt-OUT endpoint (0x02 on 0x1020) */
+	/* locate OUT endpoint (new board only) */
 	for (i = 0; i < intf->cur_altsetting->desc.bNumEndpoints; ++i) {
 		struct usb_endpoint_descriptor *ep =
 			&intf->cur_altsetting->endpoint[i].desc;
@@ -309,24 +301,27 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		}
 	}
 
-	/* parse HID and start with HIDRAW only */
+	/* init HID  ----------------------------------------------------------- */
 	ret = hid_parse(hdev);
 	if (ret)
-		goto err_count;
+		goto err_dec;
 
 	ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
 	if (ret)
-		goto err_count;
+		goto err_dec;
 
-	/* allocate input device ------------------------------------------------ */
+	/* clear idle timer so device replies to GET_REPORT ------------------ */
+	piuio_set_idle(piu);		/* ignore failure, best-effort */
+
+	/* input device ------------------------------------------------------- */
 	piu->idev = devm_input_allocate_device(&hdev->dev);
 	if (!piu->idev) {
 		ret = -ENOMEM;
-		goto err_stop_hw;
+		goto err_hw;
 	}
 
-	snprintf(piu->phys, sizeof(piu->phys),
-		 "%s/input0", hdev->phys ? : "piuio");
+	snprintf(piu->phys, sizeof(piu->phys), "%s/input0",
+		 hdev->phys ? : "piuio");
 	piu->idev->name       = "PIUIO Panel";
 	piu->idev->phys       = piu->phys;
 	piu->idev->dev.parent = &hdev->dev;
@@ -338,17 +333,17 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 
 	set_bit(EV_KEY, piu->idev->evbit);
 	for (i = 0; i < PIUIO_NUM_INPUTS; ++i) {
-		int kc = piuio_keycode(i);
+		const int kc = piuio_keycode(i);
 		if (kc > 0)
 			set_bit(kc, piu->idev->keybit);
 	}
 
 	ret = input_register_device(piu->idev);
 	if (ret)
-		goto err_stop_hw;
+		goto err_hw;
 
 #ifdef CONFIG_LEDS_CLASS
-	/* LED class-devices ---------------------------------------------------- */
+	/* LED classdev -------------------------------------------------------- */
 	piu->leds = devm_kcalloc(&hdev->dev, PIUIO_MAX_LEDS,
 				 sizeof(*piu->leds), GFP_KERNEL);
 	if (!piu->leds) {
@@ -359,12 +354,11 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	for (i = 0; i < PIUIO_MAX_LEDS; ++i) {
 		struct piuio_led *ld = &piu->leds[i];
 
-		ld->parent              = piu;
-		ld->idx                 = i;
-		ld->cdev.name =
-			devm_kasprintf(&hdev->dev, GFP_KERNEL,
-				       "piuio:%s:led%02d",
-				       dev_name(&hdev->dev), i);
+		ld->parent    = piu;
+		ld->idx       = i;
+		ld->cdev.name = devm_kasprintf(&hdev->dev, GFP_KERNEL,
+					       "piuio:%s:led%02d",
+					       dev_name(&hdev->dev), i);
 		ld->cdev.max_brightness          = 1;
 		ld->cdev.brightness_set_blocking = piuio_led_set;
 
@@ -374,11 +368,11 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	}
 	leds_ok = 1;
 
-	/* resources for interrupt-OUT (0×1020 only) ---------------------------- */
+	/* resources for OUT endpoint (new board) ---------------------------- */
 	if (id->product == USB_PRODUCT_ID_BTNBOARD_NEW && ep_out) {
-		piu->out_buf =
-			devm_kzalloc(&hdev->dev, PIUIO_OUTPUT_SIZE_NEW,
-				     GFP_KERNEL);
+		piu->out_buf = devm_kzalloc(&hdev->dev,
+					    PIUIO_OUTPUT_SIZE_NEW,
+					    GFP_KERNEL);
 		piu->out_urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (!piu->out_buf || !piu->out_urb) {
 			ret = -ENOMEM;
@@ -389,10 +383,10 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	}
 #endif /* CONFIG_LEDS_CLASS */
 
-	/* legacy misc node ----------------------------------------------------- */
+	/* legacy misc char-dev ---------------------------------------------- */
 	piu->misc_name = devm_kasprintf(&hdev->dev, GFP_KERNEL,
-					"piuio%d",
-					atomic_read(&piuio_device_count) - 1);
+				       "piuio%d",
+				       atomic_read(&piuio_device_count) - 1);
 	piu->misc.minor  = MISC_DYNAMIC_MINOR;
 	piu->misc.name   = piu->misc_name;
 	piu->misc.fops   = &piuio_misc_fops;
@@ -403,8 +397,8 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		goto err_leds;
 	dev_set_drvdata(piu->misc.this_device, piu);
 
-	/* global poll work & timer (only one device allowed) ------------------ */
-	piuio_poll_ctx = piu;			/* make current board the owner */
+	/* global poll work+timer ------------------------------------------- */
+	piuio_poll_ctx = piu;
 	INIT_WORK(&piuio_poll_work, piuio_do_poll);
 
 	hrtimer_init(&piu->poll_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -413,9 +407,12 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		      ms_to_ktime(clamped_poll_interval()),
 		      HRTIMER_MODE_REL);
 
+	pr_info("piuio_hid: board %04x:%04x bound as /dev/%s (poll %d ms)\n",
+		hdev->vendor, hdev->product, piu->misc.name,
+		clamped_poll_interval());
 	return 0;
 
-/* --- error paths --------------------------------------------------------- */
+/* ---------- error paths -------------------------------------------------- */
 err_leds:
 #ifdef CONFIG_LEDS_CLASS
 	if (leds_ok)
@@ -424,16 +421,16 @@ err_leds:
 	if (piu->out_urb)
 		usb_free_urb(piu->out_urb);
 #endif
-err_stop_hw:
+err_hw:
 	hid_hw_stop(hdev);
-err_count:
+err_dec:
 	atomic_dec(&piuio_device_count);
 	return ret;
 }
 
-/* ------------------------------------------------------------------------- */
-/*                                remove                                     */
-/* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/*                                remove                              */
+/* ------------------------------------------------------------------ */
 
 static void piuio_remove(struct hid_device *hdev)
 {
@@ -445,7 +442,6 @@ static void piuio_remove(struct hid_device *hdev)
 		return;
 
 	atomic_set(&piu->shutting_down, 1);
-
 	hrtimer_cancel(&piu->poll_timer);
 	cancel_work_sync(&piuio_poll_work);
 	piuio_poll_ctx = NULL;
@@ -464,9 +460,9 @@ static void piuio_remove(struct hid_device *hdev)
 	atomic_dec(&piuio_device_count);
 }
 
-/* ------------------------------------------------------------------------- */
-/*                           hid_driver struct                               */
-/* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/*                         driver definition                          */
+/* ------------------------------------------------------------------ */
 
 static const struct hid_device_id piuio_ids[] = {
 	{ HID_USB_DEVICE(USB_VENDOR_ID_BTNBOARD,
@@ -486,5 +482,5 @@ static struct hid_driver piuio_driver = {
 module_hid_driver(piuio_driver);
 
 MODULE_AUTHOR("Diego Acevedo");
-MODULE_DESCRIPTION("PIUIO HID driver – legacy 0x1010 + new 0x1020 support");
+MODULE_DESCRIPTION("PIUIO HID driver – 0x1010 & 0x1020 button boards");
 MODULE_LICENSE("GPL v2");
