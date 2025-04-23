@@ -1,22 +1,22 @@
 /*
  * PIUIO HID interface driver – unified support for 0x1010 (legacy) and
- * 0x1020 (new) button‑board revisions.
+ * 0x1020 (new) button-board revisions.
  *
  * The 0x1020 board is *fully polled*: the host must issue a HID GET_REPORT
- * (ID 0x30, 32 B) on the control pipe to obtain the current input matrix.
- * The device never pushes that report on the interrupt‑IN endpoint, so we
+ * (ID 0x30, 32 B) on the control pipe to obtain the current input matrix.
+ * The device never pushes that report on the interrupt-IN endpoint, so we
  * drive the poll loop ourselves with a hrtimer.
  *
- * Outputs (LEDs, mux‑select, etc.) are sent through the interrupt‑OUT
- * endpoint as report 0x13 (16 B).  Older 0x1010 hardware did not expose an
- * OUT endpoint; the driver therefore only queues interrupt‑OUT URBs for the
- * 0x1020 product‑ID and silently ignores writes for 0x1010.
+ * Outputs (LEDs, mux-select, etc.) are sent through the interrupt-OUT
+ * endpoint as report 0x13 (16 B).  Older 0x1010 hardware did not expose an
+ * OUT endpoint; the driver therefore only queues interrupt-OUT URBs for the
+ * 0x1020 product-ID and silently ignores writes for 0x1010.
  *
- * Copyright (C) 2012‑2014 Devin J. Pohly <djpohly+linux@gmail.com>
- * Copyright (C) 2025        Diego Acevedo  <diego.acevedo.fernando@gmail.com>
+ * Copyright (C) 2012-2014 Devin J. Pohly <djpohly+linux@gmail.com>
+ * Copyright (C) 2025        Diego Acevedo  <diego.acevedo.fernando@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2.
+ * under the terms of the GNU General Public License version 2.
  */
 
 #include <linux/module.h>
@@ -50,7 +50,7 @@
 /*                       module parameters / helpers                         */
 /* ------------------------------------------------------------------------- */
 
-static int poll_interval_ms = 4;           /* default 250 Hz */
+static int poll_interval_ms = 4;           /* default 250 Hz */
 module_param(poll_interval_ms, int, 0444);
 MODULE_PARM_DESC(poll_interval_ms,
 	         "Polling interval in milliseconds for input reports (1–1000)");
@@ -199,7 +199,7 @@ static int piuio_led_set(struct led_classdev *cdev, enum led_brightness val)
 #endif /* CONFIG_LEDS_CLASS */
 
 /* ------------------------------------------------------------------------- */
-/*                misc‑device (legacy /dev/piuioX) write handler             */
+/*                misc-device (legacy /dev/piuioX) write handler             */
 /* ------------------------------------------------------------------------- */
 
 static ssize_t piuio_misc_write(struct file *f, const char __user *ubuf,
@@ -283,7 +283,7 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	spin_lock_init(&piu->led_lock);
 #endif
 
-	/* locate interrupt‑OUT endpoint (0x02 on 0x1020) */
+	/* locate interrupt-OUT endpoint (0x02 on 0x1020) */
 	for (i = 0; i < intf->cur_altsetting->desc.bNumEndpoints; ++i) {
 		struct usb_endpoint_descriptor *ep = &intf->cur_altsetting->endpoint[i].desc;
 		if (usb_endpoint_is_int_out(ep)) {
@@ -330,11 +330,12 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		goto err_stop_hw;
 
 #ifdef CONFIG_LEDS_CLASS
-	/* LED class‑devs */
-	piu->leds = devm_kcalloc(&hdev->dev, PIUIO_MAX_LEDS, sizeof(*piu->leds), GFP_KERNEL);
+	/* LED class-devs */
+	piu->leds = devm_kcalloc(&hdev->dev, PIUIO_MAX_LEDS,
+				 sizeof(*piu->leds), GFP_KERNEL);
 	if (!piu->leds) {
 		ret = -ENOMEM;
-		goto err_unreg_input;
+		goto err_leds;
 	}
 
 	for (i = 0; i < PIUIO_MAX_LEDS; ++i) {
@@ -383,14 +384,16 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	return 0;
 
 /* --- error paths --------------------------------------------------------- */
-#ifdef CONFIG_LEDS_CLASS
 err_leds:
+#ifdef CONFIG_LEDS_CLASS
 	if (leds_ok)
 		for (i = 0; i < PIUIO_MAX_LEDS; ++i)
 			led_classdev_unregister(&piu->leds[i].cdev);
 	if (piu->out_urb)
 		usb_free_urb(piu->out_urb);
-#endif
+#endif /* CONFIG_LEDS_CLASS */
+	goto err_unreg_input;
+
 err_unreg_input:
 	input_unregister_device(piu->idev);
 err_stop_hw:
@@ -451,6 +454,6 @@ static struct hid_driver piuio_driver = {
 };
 module_hid_driver(piuio_driver);
 
-MODULE_AUTHOR("Diego Acevedo");
+MODULE_AUTHOR("Diego Acevedo");
 MODULE_DESCRIPTION("PIUIO HID driver – legacy 0x1010 + new 0x1020 support");
 MODULE_LICENSE("GPL v2");
