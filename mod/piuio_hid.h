@@ -1,100 +1,101 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/* Public interface (driver-internal only) for the PIUIO HID driver */
+
 #ifndef _PIUIO_HID_H
 #define _PIUIO_HID_H
 
-#include <linux/hid.h>          // Basic HID types
+#include <linux/hid.h>
+#include <linux/usb.h>
+#include <linux/input.h>
+#include <linux/miscdevice.h>
+#include <linux/hrtimer.h>
+#include <linux/atomic.h>
+#include <linux/spinlock_types.h>
 #ifdef CONFIG_LEDS_CLASS
-#include <linux/leds.h>         // struct led_classdev
+#include <linux/leds.h>
 #endif
-#include <linux/spinlock_types.h>// spinlock_t
-#include <linux/miscdevice.h>   // struct miscdevice
-#include <linux/usb.h>          // struct usb_device, struct urb
-#include <linux/input.h>        // struct input_dev
-#include <linux/hrtimer.h>      // High-resolution timer
-#include <linux/types.h>        // u8, etc.
-#include <linux/atomic.h>       // atomic_t
-#include <linux/device.h>       // Required for dev_get/set_drvdata prototypes
-#include <linux/kconfig.h>      // For IS_ENABLED macro
 
-
-/* Device and protocol definitions */
+/* ------------------------------------------------------------------ */
+/*                     device-/protocol-level constants               */
+/* ------------------------------------------------------------------ */
 #define USB_VENDOR_ID_BTNBOARD          0x0d2f
-#define USB_PRODUCT_ID_BTNBOARD_LEGACY  0x1010 // Original/Legacy device ID
-#define USB_PRODUCT_ID_BTNBOARD_NEW     0x1020 // New device ID (verified)
+#define USB_PRODUCT_ID_BTNBOARD_LEGACY  0x1010 /* original board  */
+#define USB_PRODUCT_ID_BTNBOARD_NEW     0x1020 /* board in traces */
 
-// Report IDs/sizes based on 0x1020 analysis
-#define PIUIO_INPUT_REPORT_ID    0x30 // Report ID for input (GET_REPORT 0x0130)
-#define PIUIO_OUTPUT_REPORT_ID   0x13 // Report ID for output/feature (Interrupt OUT)
-#define PIUIO_LEGACY_SIZE        8    // Expected size for legacy /dev/piuio0 writes
+#define PIUIO_INPUT_REPORT_ID           0x30   /* GET_REPORT 0x0130 */
+#define PIUIO_OUTPUT_REPORT_ID          0x13   /* Interrupt-OUT     */
 
-#define PIUIO_NUM_INPUTS         48   // Max number of inputs assumed (affects keycode mapping)
+#define PIUIO_INPUT_SIZE_NEW            32     /* incl. report ID   */
+#define PIUIO_OUTPUT_SIZE_NEW           16
+#define PIUIO_INPUT_BUF_SIZE            PIUIO_INPUT_SIZE_NEW
+
+#define PIUIO_LEGACY_SIZE               8      /* write() payload   */
+
+#define PIUIO_NUM_INPUTS                48
 #ifdef CONFIG_LEDS_CLASS
-#define PIUIO_MAX_LEDS           48   // Max number of LEDs assumed
+#define PIUIO_MAX_LEDS                  48
 #endif
 
-// Input/Output report sizes based on 0x1020 analysis
-#define PIUIO_INPUT_SIZE_NEW     32
-#define PIUIO_INPUT_BUF_SIZE     (PIUIO_INPUT_SIZE_NEW)
-#define PIUIO_OUTPUT_SIZE_NEW    16
+#define PIUIO_BTN_REG                   BTN_JOYSTICK
+#define PIUIO_BTN_EXTRA                 BTN_TRIGGER_HAPPY
 
-// Endpoint Addresses
-#define PIUIO_INT_OUT_EP         0x02 // Interrupt OUT endpoint address for 1020
-
-// Input keycode mapping ranges
-#define PIUIO_BTN_REG            BTN_JOYSTICK
-#define PIUIO_BTN_EXTRA          BTN_TRIGGER_HAPPY
-
-// HID Class Request Codes
-#ifndef HID_REQ_SET_IDLE
-#define HID_REQ_SET_IDLE                0x0A
-#endif
-#ifndef HID_REQ_GET_REPORT
-#define HID_REQ_GET_REPORT              0x01
-#endif
-#ifndef HID_REQ_SET_REPORT
-#define HID_REQ_SET_REPORT              0x09
-#endif
-
-#ifdef CONFIG_LEDS_CLASS
-// Forward declaration
+/* ------------------------------------------------------------------ */
+/*                           forward declarations                     */
+/* ------------------------------------------------------------------ */
 struct piuio;
-
-// LED Structure
+#ifdef CONFIG_LEDS_CLASS
 struct piuio_led {
-	struct piuio *piu;
-	struct led_classdev cdev;
-	u8 idx;
+	struct piuio        *parent;
+	struct led_classdev  cdev;
+	u8                   idx;
 };
-#endif // CONFIG_LEDS_CLASS
+#endif
 
-// Main Device Structure
+/* ------------------------------------------------------------------ */
+/*                          main device structure                     */
+/* ------------------------------------------------------------------ */
 struct piuio {
-	struct hid_device    *hdev;
-	struct usb_device    *udev;
-	struct input_dev     *idev;
-	u8                    iface;
-	char                  phys[64]; // Physical path string
+	/* generic / identification */
+	struct hid_device   *hdev;
+	struct usb_device   *udev;
+	struct input_dev    *idev;
+	u8                   iface;
+	char                 phys[64];
 
-	/* Input Handling (Polling GET_REPORT) */
-	u8                    in_buf[PIUIO_INPUT_BUF_SIZE]; // Buffer for polling input
-	struct hrtimer        timer;     // Timer for polling input
+	/* ---- input polling (GET_REPORT) ---- */
+	u8                   in_buf[PIUIO_INPUT_BUF_SIZE];
+	struct hrtimer       poll_timer;
+	atomic_t             shutting_down;
 
 #ifdef CONFIG_LEDS_CLASS
-	/* Output Handling (LEDs) */
-	u8                    led_shadow[PIUIO_MAX_LEDS]; // Shadow state for LEDs
-	struct piuio_led     *led;          // Array of LED structures (devm allocated)
-	spinlock_t            led_lock;     // Protects led_shadow
-#endif // CONFIG_LEDS_CLASS
+	/* ---- LED / output bookkeeping ---- */
+	u8                   led_shadow[PIUIO_MAX_LEDS];
+	struct piuio_led    *leds;
+	spinlock_t           led_lock;
+#endif
 
-	/* Output Handling (Interrupt OUT - 1020) */
-	struct urb           *output_urb;   // URB for Interrupt OUT data (MANUAL alloc/free)
-	u8                   *output_buf;   // Buffer for Interrupt OUT data (devm allocated)
-	unsigned int          output_pipe;  // Pipe for Interrupt OUT
-	spinlock_t            output_submit_lock; // Protects output URB submission state
-	atomic_t              output_active;// Flag: is output URB currently submitted?
+	/* ---- interrupt-OUT resources (0x1020 only) ---- */
+	struct urb          *out_urb;
+	u8                  *out_buf;
+	unsigned int         out_pipe;
+	spinlock_t           out_lock;
+	atomic_t             out_active;
 
-	/* Misc Device */
-	struct miscdevice     misc;         // Misc character device structure
-	char                 *misc_name;    // Name for misc device (devm allocated)
+	/* ---- legacy misc char-dev ---- */
+	struct miscdevice    misc;
+	char                *misc_name;
 };
 
-#endif // _PIUIO_HID_H
+/* helper exported for sparse-forward reference in .c */
+static inline int piuio_keycode(unsigned int pin)
+{
+	if (pin >= PIUIO_NUM_INPUTS)
+		return -EINVAL;
+
+	if (pin < (BTN_GAMEPAD - BTN_JOYSTICK))
+		return PIUIO_BTN_REG + pin;
+
+	return PIUIO_BTN_EXTRA + (pin - (BTN_GAMEPAD - BTN_JOYSTICK));
+}
+
+#endif /* _PIUIO_HID_H */
