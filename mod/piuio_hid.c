@@ -9,11 +9,12 @@
  *              byte 1 = constant 0
  *              bytes 2-7 = 48-bit input matrix (LSB first)
  *
- *  The driver copies those 6 bytes into an internal 32-byte buffer so that
- *  existing key-mapping logic (written for the 0x1010 layout) keeps working.
+ *    The driver copies those 6 bytes into its 32-byte `in_buf[]`, so all
+ *    existing key-mapping logic (written for the 0x1010 layout) keeps
+ *    working unchanged.
  *
- *  Copyright (C) 2012-2014 Devin J. Pohly  <djpohly+linux@gmail.com>
- *  Copyright (C) 2025        Diego Acevedo <diego.acevedo.fernando@gmail.com>
+ *  Copyright (C) 2012-2014 Devin J. Pohly   <djpohly+linux@gmail.com>
+ *  Copyright (C) 2025      Diego Acevedo    <diego.acevedo.fernando@gmail.com>
  */
 
 #include <linux/module.h>
@@ -36,7 +37,7 @@
 /*                     module parameters / helpers                    */
 /* ------------------------------------------------------------------ */
 
-static int poll_interval_ms = 4;			/* 250 Hz default           */
+static int poll_interval_ms = 4;			/* 250 Hz default */
 module_param(poll_interval_ms, int, 0444);
 MODULE_PARM_DESC(poll_interval_ms,
 		 "Polling interval in milliseconds (1–1000)");
@@ -50,11 +51,16 @@ static inline int clamped_poll_interval(void)
 static atomic_t piuio_device_count = ATOMIC_INIT(0);
 
 /* ------------------------------------------------------------------ */
-/*                    global poll work (single board)                 */
+/*         global poll work (only one board may be active)            */
 /* ------------------------------------------------------------------ */
 
 static struct work_struct piuio_poll_work;	/* worker */
 static struct piuio      *piuio_poll_ctx;	/* current board */
+
+/* single DMA-safe poll buffer (0x1020 only, 258 B) ------------------ */
+#define PIUIO_POLL_REPORT_ID    0x01
+#define PIUIO_POLL_REPORT_SIZE  258		/* incl. report-ID */
+static u8 *piuio_poll_buf;			/* allocated at probe */
 
 static void piuio_do_poll(struct work_struct *);
 
@@ -69,7 +75,7 @@ static int  piuio_led_set(struct led_classdev *, enum led_brightness);
 static int  piuio_queue_output(struct piuio *);
 #endif
 
-/* SET_IDLE(duration=0, id=0) --------------------------------------- */
+/* SET_IDLE(duration 0, id 0) --------------------------------------- */
 static int piuio_set_idle(struct piuio *piu)
 {
 	return usb_control_msg(piu->udev, usb_sndctrlpipe(piu->udev, 0),
@@ -83,30 +89,28 @@ static int piuio_set_idle(struct piuio *piu)
 /*               USB helpers – input polling (0x1020)                 */
 /* ------------------------------------------------------------------ */
 
-#define PIUIO_POLL_REPORT_ID    0x01
-#define PIUIO_POLL_REPORT_SIZE  258	/* incl. report-ID */
-
 static int piuio_get_input_report(struct piuio *piu)
 {
-	u8   buf[PIUIO_POLL_REPORT_SIZE];
-	u16  wValue = (HID_FEATURE_REPORT << 8) | PIUIO_POLL_REPORT_ID;
-	int  ret;
+	u16 wValue = (HID_FEATURE_REPORT << 8) | PIUIO_POLL_REPORT_ID;
+	int ret;
+
+	if (!piuio_poll_buf)
+		return -EINVAL;		/* should never happen */
 
 	ret = usb_control_msg(piu->udev, usb_rcvctrlpipe(piu->udev, 0),
 			      HID_REQ_GET_REPORT,
 			      USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
 			      wValue, piu->iface,
-			      buf, sizeof(buf), msecs_to_jiffies(50));
+			      piuio_poll_buf, PIUIO_POLL_REPORT_SIZE,
+			      msecs_to_jiffies(50));
 	if (ret < 0)
 		return ret;
 	if (ret != PIUIO_POLL_REPORT_SIZE)
 		return -EIO;
 
-	/* copy the 48-bit button matrix (bytes 2-7) into driver buffer
-	 * so existing key-mapping logic keeps working unchanged          */
+	/* copy 48-bit button matrix (bytes 2-7) into in_buf[1…6] */
 	memset(piu->in_buf, 0, PIUIO_INPUT_BUF_SIZE);
-	memcpy(&piu->in_buf[1], &buf[2], 6);	/* skip report-ID + pad byte */
-
+	memcpy(&piu->in_buf[1], &piuio_poll_buf[2], 6);
 	return 0;
 }
 
@@ -174,7 +178,7 @@ static int piuio_queue_output(struct piuio *piu)
 	unsigned long flags;
 	int i, ret;
 
-	if (!piu->out_urb)		/* legacy 0x1010 – ignore */
+	if (!piu->out_urb)			/* legacy 0x1010 – ignore */
 		return 0;
 
 	spin_lock_irqsave(&piu->out_lock, flags);
@@ -322,6 +326,17 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
 	if (ret)
 		goto err_dec;
+
+	/* allocate global DMA-safe poll buffer once ------------------------- */
+	if (!piuio_poll_buf) {
+		piuio_poll_buf =
+			devm_kmalloc(&hdev->dev, PIUIO_POLL_REPORT_SIZE,
+				     GFP_KERNEL);
+		if (!piuio_poll_buf) {
+			ret = -ENOMEM;
+			goto err_hw;
+		}
+	}
 
 	piuio_set_idle(piu);	/* best-effort – ignore failures */
 
