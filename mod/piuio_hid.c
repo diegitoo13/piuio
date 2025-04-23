@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  *  PIUIO HID interface driver – unified support for the 0x1010 (legacy)
- *  and 0x1020 (new, fully-polled) button-board revisions.
+ *  and 0x1020 (new, *polled*) button-board revisions.
  *
  *  ● 0x1010  – matrix is pushed on the interrupt-IN pipe → nothing special.
- *  ● 0x1020  – host must actively poll FEATURE-report 0x01 (258 B):
- *              byte 0 = report-ID (0x01)
- *              byte 1 = constant 0
- *              bytes 2-7 = 48-bit input matrix (LSB first)
+ *  ● 0x1020  – host must actively poll **INPUT-report 0x30 (32 B)**  
+ *              byte 0  = report-ID (0x30)  
+ *              bytes 1-6 = 48-bit input matrix (LSB first)
  *
- *    The driver copies those 6 bytes into its 32-byte `in_buf[]`, so all
- *    existing key-mapping logic (written for the 0x1010 layout) keeps
- *    working unchanged.
+ *    The driver copies those 6 bytes straight into its 32-byte `in_buf[]`,
+ *    so all existing key-mapping logic (written for the 0x1010 layout)
+ *    keeps working unchanged.
  *
  *  Copyright (C) 2012-2014 Devin J. Pohly   <djpohly+linux@gmail.com>
  *  Copyright (C) 2025      Diego Acevedo    <diego.acevedo.fernando@gmail.com>
@@ -57,11 +56,6 @@ static atomic_t piuio_device_count = ATOMIC_INIT(0);
 static struct work_struct piuio_poll_work;	/* worker */
 static struct piuio      *piuio_poll_ctx;	/* current board */
 
-/* single DMA-safe poll buffer (0x1020 only, 258 B) ------------------ */
-#define PIUIO_POLL_REPORT_ID    0x01
-#define PIUIO_POLL_REPORT_SIZE  258		/* incl. report-ID */
-static u8 *piuio_poll_buf;			/* allocated at probe */
-
 static void piuio_do_poll(struct work_struct *);
 
 /* ------------------------------------------------------------------ */
@@ -89,29 +83,24 @@ static int piuio_set_idle(struct piuio *piu)
 /*               USB helpers – input polling (0x1020)                 */
 /* ------------------------------------------------------------------ */
 
+#define PIUIO_POLL_REPORT_ID    0x30	/* INPUT report */
+#define PIUIO_POLL_REPORT_SIZE  32	/* incl. report-ID */
+
 static int piuio_get_input_report(struct piuio *piu)
 {
-	u16 wValue = (HID_FEATURE_REPORT << 8) | PIUIO_POLL_REPORT_ID;
+	u16 wValue = (HID_INPUT_REPORT << 8) | PIUIO_POLL_REPORT_ID;
 	int ret;
 
-	if (!piuio_poll_buf)
-		return -EINVAL;		/* should never happen */
-
+	/* fetch report directly into in_buf (DMA-safe, kmalloc’ed) */
 	ret = usb_control_msg(piu->udev, usb_rcvctrlpipe(piu->udev, 0),
 			      HID_REQ_GET_REPORT,
 			      USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
 			      wValue, piu->iface,
-			      piuio_poll_buf, PIUIO_POLL_REPORT_SIZE,
+			      piu->in_buf, PIUIO_POLL_REPORT_SIZE,
 			      msecs_to_jiffies(50));
 	if (ret < 0)
 		return ret;
-	if (ret != PIUIO_POLL_REPORT_SIZE)
-		return -EIO;
-
-	/* copy 48-bit button matrix (bytes 2-7) into in_buf[1…6] */
-	memset(piu->in_buf, 0, PIUIO_INPUT_BUF_SIZE);
-	memcpy(&piu->in_buf[1], &piuio_poll_buf[2], 6);
-	return 0;
+	return (ret == PIUIO_POLL_REPORT_SIZE) ? 0 : -EIO;
 }
 
 static void piuio_send_keys(struct piuio *piu)
@@ -326,17 +315,6 @@ static int piuio_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
 	if (ret)
 		goto err_dec;
-
-	/* allocate global DMA-safe poll buffer once ------------------------- */
-	if (!piuio_poll_buf) {
-		piuio_poll_buf =
-			devm_kmalloc(&hdev->dev, PIUIO_POLL_REPORT_SIZE,
-				     GFP_KERNEL);
-		if (!piuio_poll_buf) {
-			ret = -ENOMEM;
-			goto err_hw;
-		}
-	}
 
 	piuio_set_idle(piu);	/* best-effort – ignore failures */
 
