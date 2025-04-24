@@ -1,0 +1,114 @@
+# .github/workflows/ci.yml
+
+name: Basic CI Checks
+
+# Controls when the workflow will run
+on:
+  push:
+    branches: [ main ] # Adjust branches as needed
+  pull_request:
+    branches: [ main ] # Adjust branches as needed
+
+jobs:
+  test:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Set up Python environment
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # Install system dependencies needed for the scripts or testing tools
+      - name: Install base system dependencies (shellcheck)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y shellcheck python3-pip
+
+      # Install Python dependencies
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 pyusb pynput
+          # Note: pyusb and pynput are installed to allow flake8/syntax checks
+          # on the python script, not for functional testing in CI.
+
+      # Lint Python code with flake8
+      - name: Lint Python with flake8
+        run: |
+          # stop the build if there are Python syntax errors or undefined names
+          echo "Running flake8 strict checks (Syntax Errors, Undefined Names)..."
+          flake8 usb_driver.py --count --select=E9,F63,F7,F82 --show-source --statistics
+          # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+          echo "Running flake8 style checks (exit-zero)..."
+          flake8 usb_driver.py --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      # Basic Python syntax check
+      - name: Syntax check Python script
+        run: |
+          echo "Performing basic Python syntax check..."
+          python3 -m compileall usb_driver.py
+
+      # Lint shell scripts with shellcheck
+      - name: Lint shell scripts with shellcheck
+        run: |
+          echo "Linting setup_usb_driver.sh..."
+          shellcheck setup_usb_driver.sh
+          echo "Linting run_mapper.sh..."
+          shellcheck run_mapper.sh
+
+      # Basic shell script syntax check
+      - name: Syntax check shell scripts
+        run: |
+          echo "Syntax checking setup_usb_driver.sh..."
+          bash -n setup_usb_driver.sh
+          echo "Syntax checking run_mapper.sh..."
+          bash -n run_mapper.sh
+
+      # --- New Steps for Partial Execution Testing ---
+
+      # Test setup_usb_driver.sh package installation commands
+      - name: Test setup script package installation
+        run: |
+          echo "Attempting to install packages listed in setup_usb_driver.sh..."
+          # Extract the apt-get install command (adjust if script changes)
+          # This assumes the relevant line looks like: apt-get install -y python3 python3-pip libusb-1.0-0
+          PACKAGE_LINE=$(grep 'apt-get install -y' setup_usb_driver.sh | head -n 1)
+          echo "Found package install line: $PACKAGE_LINE"
+          # Run the extracted command with sudo
+          sudo $PACKAGE_LINE || { echo "Package installation step failed"; exit 1; }
+          echo "Package installation command executed successfully."
+
+      # Trace execution of setup_usb_driver.sh without sudo (will show errors)
+      - name: Trace execution of setup_usb_driver.sh (no sudo)
+        run: |
+          echo "Tracing setup_usb_driver.sh execution path (expect permission errors)..."
+          # Make executable just in case
+          chmod +x setup_usb_driver.sh
+          # Run with bash -x, ignore errors with '|| true' as failures are expected
+          bash -x ./setup_usb_driver.sh || true
+          echo "Trace finished."
+
+      # Trace execution of run_mapper.sh without sudo (will show errors)
+      - name: Trace execution of run_mapper.sh (no sudo)
+        run: |
+          echo "Tracing run_mapper.sh execution path (expect sudo/terminal errors)..."
+          # Make executable
+          chmod +x run_mapper.sh
+          # Run with bash -x, ignore errors
+          bash -x ./run_mapper.sh || true
+          echo "Trace finished."
+
+      # --- End of New Steps ---
+
+      # Placeholder for future tests (e.g., pytest if you add unit tests)
+      # - name: Test with pytest
+      #   run: |
+      #     pip install pytest pytest-mock # If using pytest and mocking
+      #     pytest tests/ # Assuming tests are in a 'tests' directory
