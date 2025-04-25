@@ -48,7 +48,7 @@ jobs:
 
       - name: Show Module Info
         run: |
-          MOD_PATH="mod/piuio_hid.ko"
+          MOD_PATH="mod/piuio.ko"
           if [ -f "$MOD_PATH" ]; then
             sudo modinfo "$MOD_PATH"
           else
@@ -58,7 +58,7 @@ jobs:
       - name: Load and Unload Module [native kernel only]
         if: matrix.kernel_version == 'native'
         run: |
-          MOD_PATH="mod/piuio_hid.ko"
+          MOD_PATH="mod/piuio.ko"
           sudo insmod "$MOD_PATH" || { dmesg | tail -20; exit 1; }
           sleep 2
           dmesg | tail -20 | grep -Ei '(BUG|panic|oops|warn|error)' && exit 1 || echo "No critical errors detected."
