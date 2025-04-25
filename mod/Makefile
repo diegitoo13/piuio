@@ -1,5 +1,5 @@
 # Module object name (e.g., piuio_hid.o if your C file is piuio_hid.c)
-obj-m         := piuio_hid.o
+obj-m         := piuio.o
 
 # Kernel version/directories (allow overrides via command line)
 KVER          ?= $(shell uname -r)
