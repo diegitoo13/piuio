@@ -1,202 +1,170 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- *  PIUIO 0x1020 button panel (polled HID) – **minimal** Linux driver
- *
- *  Copyright (C) 2025  Diego Acevedo <diego.acevedo.fernando@gmail.com>
+ * PIUIO 0x1020 button panel — 10-button **game-pad** driver
+ * 2025  Diego Acevedo <diego.acevedo.fernando@gmail.com>
  */
 
-#define pr_fmt(fmt) "piuio_hid: " fmt
+#define pr_fmt(fmt) "piuio_gp: " fmt
 
 #include <linux/module.h>
-#include <linux/kernel.h>
 #include <linux/usb.h>
 #include <linux/hid.h>
 #include <linux/input.h>
-#include <linux/byteorder/generic.h>
-#include <linux/ratelimit.h>
 #include <linux/hrtimer.h>
 #include <linux/workqueue.h>
-#include <linux/spinlock.h>
+#include <linux/ratelimit.h>
 
-/* ------------------------------------------------------------------ */
-/*                      device-specific constants                     */
-/* ------------------------------------------------------------------ */
-#define VENDOR_ID_PIUIO        0x0d2f
-#define PROD_ID_PIUIO_1020     0x1020
+/* ───────── device IDs & report layout ─────────────────────────── */
+#define VID_PIUIO      0x0d2f
+#define PID_PIUIO1020  0x1020
+#define REP_ID         0x30
+#define REP_LEN        9          /* 1-byte ID + 8 data                 */
 
-#define REPORT_ID_INPUT        0x30
-#define REPORT_LEN_INPUT       9       /* 1-byte ID + 8-byte matrix */
+/* ───────── byte-value → game-pad button map (10 entries) ───────── */
+struct mapent { u8 val; u8 byte; u16 btn; };
 
-#define NUM_KEYS               48
+/* Player 1 : bytes 0-3 (index 0-3) */
+static const struct mapent map[10] = {
+	/* value, byte-idx, evdev code                  */
+	{ 0xFE, 0, BTN_SOUTH  },   /* Down-Left  */
+	{ 0xFB, 1, BTN_WEST   },   /* Up-Left    */
+	{ 0xEF, 2, BTN_NORTH  },   /* Centre     */
+	{ 0xFD, 3, BTN_EAST   },   /* Up-Right   */
+	{ 0xF7, 0, BTN_TL     },   /* Down-Right */
 
-/* simple key map – adjust to taste ----------------------------------------- */
-static const unsigned short piu_keymap[NUM_KEYS] = {
-	/* row0 */ KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T, KEY_Y, KEY_U, KEY_I,
-	/* row1 */ KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K,
-	/* row2 */ KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B, KEY_N, KEY_M, KEY_COMMA,
-	/* row3 */ KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_SPACE, KEY_ESC,
-	/* row4 */ KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8,
-	/* row5 */ KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7, KEY_F8,
+	/* Player 2 : bytes 4-7 (index 4-7) */
+	{ 0xFE, 4, BTN_TR        },
+	{ 0xFB, 5, BTN_SELECT    },
+	{ 0xEF, 6, BTN_START     },
+	{ 0xFD, 7, BTN_THUMBL    },
+	{ 0xF7, 4, BTN_THUMBR    },
 };
-static inline unsigned short kc(int idx) { return piu_keymap[idx]; }
 
-/* ------------------------------------------------------------------ */
+#define NUM_BTNS 10
+
+/* ───────── driver private ─────────────────────────────────────── */
 struct piuio {
 	struct hid_device *hdev;
 	struct usb_device *udev;
 	int                iface;
 
 	struct input_dev  *idev;
-	u8                 buf[REPORT_LEN_INPUT] ____cacheline_aligned;
+	u8                 buf[REP_LEN];
+	bool               down[NUM_BTNS];
 
-	struct hrtimer     timer;
-	struct work_struct poll_work;
-	atomic_t           shutting_down;
+	struct hrtimer     tim;
+	struct work_struct poll_wq;
+	atomic_t           stop;
 };
+static struct piuio *ctx;
 
-/* ------------------------------------------------------------------ */
-static DEFINE_RATELIMIT_STATE(piu_rl, HZ, 10);
-#define DBG_RL(fmt, ...)   do { if (__ratelimit(&piu_rl)) \
-				pr_debug(fmt, ##__VA_ARGS__); } while (0)
+/* ───────── module param – poll rate (ms) ───────────────────────── */
+static int poll_ms = 4;
+module_param(poll_ms, int, 0444);
+MODULE_PARM_DESC(poll_ms, "Polling interval in ms (1-1000)");
 
-/* ------------------------------------------------------------------ */
-static int poll_interval_ms = 4;     /* 250 Hz default */
-module_param(poll_interval_ms, int, 0444);
-MODULE_PARM_DESC(poll_interval_ms, "Polling interval (ms, 1–1000)");
+static inline int clamp_poll(void) { return clamp_val(poll_ms, 1, 1000); }
 
-static inline int poll_ms(void)
+/* ───────── USB helpers ─────────────────────────────────────────── */
+static int get_matrix(struct piuio *p)
 {
-	return clamp_val(poll_interval_ms, 1, 1000);
-}
-
-/* ------------------------------------------------------------------ *\
-|*                          USB helpers                              *|
-\* ------------------------------------------------------------------ */
-static int piu_get_matrix(struct piuio *p)
-{
-	u16 wValue = (HID_INPUT_REPORT << 8) | REPORT_ID_INPUT;
+	u16 wValue = (HID_INPUT_REPORT << 8) | REP_ID;
 	int ret = usb_control_msg(p->udev, usb_rcvctrlpipe(p->udev, 0),
 				  HID_REQ_GET_REPORT,
-				  USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+				  USB_DIR_IN|USB_TYPE_CLASS|USB_RECIP_INTERFACE,
 				  wValue, p->iface,
-				  p->buf, REPORT_LEN_INPUT,
-				  30);                       /* < 1 ms @ FS */
-	if (ret < 0)
-		return ret;
-	return (ret == REPORT_LEN_INPUT) ? 0 : -EIO;
+				  p->buf, REP_LEN, 30);
+	return (ret == REP_LEN) ? 0 : (ret < 0 ? ret : -EIO);
 }
-
-static int piu_set_idle(struct piuio *p)
+static void set_idle(struct piuio *p)
 {
-	return usb_control_msg(p->udev, usb_sndctrlpipe(p->udev, 0),
-			       HID_REQ_SET_IDLE,
-			       USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-			       0, p->iface, NULL, 0, 10);
+	usb_control_msg(p->udev, usb_sndctrlpipe(p->udev,0),
+			HID_REQ_SET_IDLE,
+			USB_DIR_OUT|USB_TYPE_CLASS|USB_RECIP_INTERFACE,
+			0, p->iface, NULL, 0, 10);
 }
 
-/* ------------------------------------------------------------------ *\
-|*                     key-matrix → input layer                      *|
-\* ------------------------------------------------------------------ */
-static void piu_report_keys(struct piuio *p)
+/* ───────── push game-pad events ────────────────────────────────── */
+static void report_buttons(struct piuio *p)
 {
 	struct input_dev *id = p->idev;
 	int i;
-	for (i = 0; i < NUM_KEYS; ++i) {
-		bool pressed = p->buf[1 + (i >> 3)] & BIT(i & 7);
-		input_report_key(id, kc(i), pressed);
+	for (i = 0; i < NUM_BTNS; ++i) {
+		const struct mapent *m = &map[i];
+		bool pressed = (p->buf[1 + m->byte] == m->val);
+		if (pressed != p->down[i]) {
+			input_report_key(id, m->btn, pressed);
+			p->down[i] = pressed;
+		}
 	}
 	input_sync(id);
 }
 
-/* ------------------------------------------------------------------ *\
-|*                         poll machinery                            *|
-\* ------------------------------------------------------------------ */
-static struct piuio *poll_ctx;
+/* ───────── poll machinery ─────────────────────────────────────── */
+static DEFINE_RATELIMIT_STATE(rl, HZ, 10);
 
-static void piu_poll_work(struct work_struct *w)
+static void poll_work(struct work_struct *w)
 {
-	struct piuio *p = poll_ctx;
-
-	if (!p || atomic_read(&p->shutting_down))
+	if (!ctx || atomic_read(&ctx->stop))
 		return;
-
-	if (!piu_get_matrix(p)) {
-		DBG_RL("matrix %*phN\n", 8, &p->buf[1]);
-		piu_report_keys(p);
+	if (!get_matrix(ctx)) {
+		if (__ratelimit(&rl))
+			pr_debug("%*phN\n", 8, &ctx->buf[1]);
+		report_buttons(ctx);
 	}
 }
-
-static enum hrtimer_restart piu_timer_cb(struct hrtimer *t)
+static enum hrtimer_restart t_cb(struct hrtimer *t)
 {
-	if (poll_ctx && !atomic_read(&poll_ctx->shutting_down))
-		queue_work(system_unbound_wq, &poll_ctx->poll_work);
-
-	hrtimer_forward_now(t, ms_to_ktime(poll_ms()));
-	return atomic_read(&poll_ctx->shutting_down)
-	       ? HRTIMER_NORESTART : HRTIMER_RESTART;
+	if (ctx && !atomic_read(&ctx->stop))
+		queue_work(system_unbound_wq, &ctx->poll_wq);
+	hrtimer_forward_now(t, ms_to_ktime(clamp_poll()));
+	return atomic_read(&ctx->stop) ? HRTIMER_NORESTART : HRTIMER_RESTART;
 }
 
-/* ------------------------------------------------------------------ *\
-|*                              probe                                *|
-\* ------------------------------------------------------------------ */
-static int piu_probe(struct hid_device *hdev,
-		     const struct hid_device_id *id)
+/* ───────── probe / remove ─────────────────────────────────────── */
+static int probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
 	struct usb_interface *intf = to_usb_interface(hdev->dev.parent);
 	struct piuio *p;
-	int i, ret;
+	int ret, i;
 
-	if (poll_ctx)        /* only one board supported */
-		return -EBUSY;
+	if (ctx) return -EBUSY;       /* one board max */
 
 	p = devm_kzalloc(&hdev->dev, sizeof(*p), GFP_KERNEL);
-	if (!p)
-		return -ENOMEM;
-
-	p->hdev  = hdev;
-	p->udev  = interface_to_usbdev(intf);
+	if (!p) return -ENOMEM;
+	p->hdev = hdev;
+	p->udev = interface_to_usbdev(intf);
 	p->iface = intf->cur_altsetting->desc.bInterfaceNumber;
 	hid_set_drvdata(hdev, p);
 
-	/* HID core ---------------------------------------------------- */
-	ret = hid_parse(hdev);
-	if (ret)
+	if ((ret = hid_parse(hdev)) ||
+	    (ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW)))
 		return ret;
-	ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
-	if (ret)
-		return ret;
+	set_idle(p);
 
-	/* one-shot SET_IDLE                                             */
-	piu_set_idle(p);
-
-	/* input-dev ---------------------------------------------------- */
+	/* input dev --------------------------------------------------- */
 	p->idev = devm_input_allocate_device(&hdev->dev);
-	if (!p->idev) {
-		ret = -ENOMEM;
-		goto err_hw;
-	}
-	p->idev->name       = "PIUIO 1020 Panel";
-	p->idev->phys       = "piuio/input0";
+	if (!p->idev) { ret = -ENOMEM; goto err_hw; }
+
+	p->idev->name       = "PIUIO 10-Button Pad";
+	p->idev->phys       = "piuio/js0";
 	p->idev->id.bustype = BUS_USB;
-	p->idev->id.vendor  = VENDOR_ID_PIUIO;
-	p->idev->id.product = PROD_ID_PIUIO_1020;
+	p->idev->id.vendor  = VID_PIUIO;
+	p->idev->id.product = PID_PIUIO1020;
 
 	set_bit(EV_KEY, p->idev->evbit);
-	for (i = 0; i < NUM_KEYS; ++i)
-		set_bit(kc(i), p->idev->keybit);
-
-	ret = input_register_device(p->idev);
-	if (ret)
+	for (i = 0; i < NUM_BTNS; ++i)
+		set_bit(map[i].btn, p->idev->keybit);
+	if ((ret = input_register_device(p->idev)))
 		goto err_hw;
 
-	/* poll timer + work ------------------------------------------ */
-	poll_ctx = p;
-	INIT_WORK(&p->poll_work, piu_poll_work);
-	hrtimer_init(&p->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	p->timer.function = piu_timer_cb;
-	hrtimer_start(&p->timer, ms_to_ktime(poll_ms()), HRTIMER_MODE_REL);
-
-	pr_info("attached 0x1020 – polling %d ms\n", poll_ms());
+	/* poll machinery --------------------------------------------- */
+	ctx = p;
+	INIT_WORK(&p->poll_wq, poll_work);
+	hrtimer_init(&p->tim, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	p->tim.function = t_cb;
+	hrtimer_start(&p->tim, ms_to_ktime(clamp_poll()), HRTIMER_MODE_REL);
+	pr_info("game-pad mode active (poll %d ms)\n", clamp_poll());
 	return 0;
 
 err_hw:
@@ -204,38 +172,34 @@ err_hw:
 	return ret;
 }
 
-/* ------------------------------------------------------------------ */
-static void piu_remove(struct hid_device *hdev)
+static void remove(struct hid_device *hdev)
 {
 	struct piuio *p = hid_get_drvdata(hdev);
+	if (!p) return;
 
-	if (!p)
-		return;
-
-	atomic_set(&p->shutting_down, 1);
-	hrtimer_cancel(&p->timer);
-	cancel_work_sync(&p->poll_work);
-	poll_ctx = NULL;
+	atomic_set(&p->stop, 1);
+	hrtimer_cancel(&p->tim);
+	cancel_work_sync(&p->poll_wq);
+	ctx = NULL;
 
 	input_unregister_device(p->idev);
 	hid_hw_stop(hdev);
 }
 
-/* ------------------------------------------------------------------ */
-static const struct hid_device_id piu_table[] = {
-	{ HID_USB_DEVICE(VENDOR_ID_PIUIO, PROD_ID_PIUIO_1020) },
-	{ }
+/* ───────── boiler-plate ───────────────────────────────────────── */
+static const struct hid_device_id ids[] = {
+	{ HID_USB_DEVICE(VID_PIUIO, PID_PIUIO1020) }, { }
 };
-MODULE_DEVICE_TABLE(hid, piu_table);
+MODULE_DEVICE_TABLE(hid, ids);
 
-static struct hid_driver piu_driver = {
+static struct hid_driver drv = {
 	.name     = "piuio_hid",
-	.id_table = piu_table,
-	.probe    = piu_probe,
-	.remove   = piu_remove,
+	.id_table = ids,
+	.probe    = probe,
+	.remove   = remove,
 };
-module_hid_driver(piu_driver);
+module_hid_driver(drv);
 
-MODULE_AUTHOR("Diego Acevedo");
 MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("Minimal PIUIO 0x1020 polled HID driver (no LEDs)");
+MODULE_AUTHOR("Diego Acevedo");
+MODULE_DESCRIPTION("PIUIO 0x1020 – 10-button game-pad driver");
