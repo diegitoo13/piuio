@@ -2,8 +2,9 @@
 /*
  * PIUIO 0x1020 – 10-button game-pad (16-byte report) + coin counter
  * 2025-04-xx  Diego Acevedo
- *   · coin logic: watch only byte-15 of Feature-report 0x01
- *   · any change ⇒ one KEY_COIN press/release pulse
+ *   · coin: watch only byte-15 of Feature-report 0x01
+ *   · any change => one KEY_COIN press/release pulse
+ *   · WAKE frame now sent through hid-core helper (reliable)
  */
 
 #define pr_fmt(fmt) "piuio_gp: " fmt
@@ -13,16 +14,17 @@
 #include <linux/hid.h>
 #include <linux/input.h>
 #include <linux/input-event-codes.h>
-#include <linux/kernel.h>      /* clamp_val() */
+#include <linux/kernel.h>          /* clamp_val() */
 #include <linux/workqueue.h>
 #include <linux/hrtimer.h>
 #include <linux/ratelimit.h>
 #include <linux/ktime.h>
 #include <linux/string.h>
+#include <linux/delay.h>           /* usleep_range() */
 
-/* ─── KEY_COIN fallback for kernels < 5.18 ─────────────────────── */
+/* ─── KEY_COIN fallback for old kernels ────────────────────────── */
 #ifndef KEY_COIN
-#define KEY_COIN  KEY_KPENTER    /* any seldom-used key is fine */
+#define KEY_COIN  KEY_KPENTER
 #endif
 
 /* ─── device IDs ───────────────────────────────────────────────── */
@@ -34,9 +36,9 @@
 #define RPT_LEN_BTN 16
 
 /* ─── coin feature report & wake frame ─────────────────────────── */
-#define COIN_RID        0x01        /* feature-report ID          */
-#define COIN_OFFSET_HI  15          /* byte 15 is the “pulse”     */
-#define COIN_BUF_LEN    258         /* full length (board expects)*/
+#define COIN_RID        0x01
+#define COIN_OFFSET_HI  15
+#define COIN_BUF_LEN    258      /* full size packet – required */
 
 #define WAKE_RID        0x81
 #define WAKE_LEN        19
@@ -44,15 +46,15 @@
 /* ─── button map (active-low) ──────────────────────────────────── */
 struct mapent { u8 mask; u16 p1, p2; };
 static const struct mapent map[5] = {
-	{ 0x01, BTN_SOUTH , BTN_TR      }, /* DL */
-	{ 0x08, BTN_WEST  , BTN_SELECT  }, /* DR */
-	{ 0x04, BTN_NORTH , BTN_START   }, /* UL */
-	{ 0x02, BTN_EAST  , BTN_THUMBL  }, /* UR */
-	{ 0x10, BTN_TL    , BTN_THUMBR  }, /* CTR */
+	{ 0x01, BTN_SOUTH , BTN_TR      },
+	{ 0x08, BTN_WEST  , BTN_SELECT  },
+	{ 0x04, BTN_NORTH , BTN_START   },
+	{ 0x02, BTN_EAST  , BTN_THUMBL  },
+	{ 0x10, BTN_TL    , BTN_THUMBR  },
 };
 #define NBTN 10
 
-/* ─── per-device context ───────────────────────────────────────── */
+/* ─── context ──────────────────────────────────────────────────── */
 struct piuio {
 	struct hid_device *hdev;
 	struct usb_device *udev;
@@ -61,7 +63,7 @@ struct piuio {
 	u8   btn_buf[RPT_LEN_BTN];
 	bool down[NBTN];
 
-	u8   coin_last;                      /* previous byte-15        */
+	u8   coin_last;
 	u8   coin_buf[COIN_BUF_LEN];
 
 	struct input_dev  *idev;
@@ -70,14 +72,14 @@ struct piuio {
 	struct hrtimer     timer;
 	atomic_t           stop;
 };
-static struct piuio *ctx;                /* single board supported */
+static struct piuio *ctx;
 
-/* ─── tunable polling interval (buttons) ───────────────────────── */
+/* ─── module param – button polling interval ───────────────────── */
 static int poll_ms = 4;
 module_param(poll_ms, int, 0444);
 static inline int clamp_poll(void) { return clamp_val(poll_ms, 1, 1000); }
 
-/* ─── USB helpers ──────────────────────────────────────────────── */
+/* ─── helpers ──────────────────────────────────────────────────── */
 static void send_wake(struct piuio *p)
 {
 	u8 buf[WAKE_LEN];
@@ -85,11 +87,11 @@ static void send_wake(struct piuio *p)
 	buf[0] = WAKE_RID;
 	memset(buf + 1, 0xFF, WAKE_LEN - 1);
 
-	usb_control_msg(p->udev, usb_sndctrlpipe(p->udev, 0),
-			HID_REQ_SET_REPORT,
-			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-			(HID_OUTPUT_REPORT << 8) | WAKE_RID,
-			p->iface, buf, WAKE_LEN, 30);
+	/* hid-core helper: takes care of autosuspend & queueing         */
+	hid_hw_output_report(p->hdev, buf, WAKE_LEN);
+
+	/* give the board a SOF interval to digest the frame             */
+	usleep_range(2000, 3000);
 }
 
 static int get_matrix(struct piuio *p)
@@ -116,7 +118,7 @@ static int read_coin_hi(struct piuio *p, u8 *hi)
 	return 0;
 }
 
-/* ─── button matrix → input events ─────────────────────────────── */
+/* ─── matrix → events ──────────────────────────────────────────── */
 static void push_btn_events(struct piuio *p)
 {
 	bool now[NBTN] = { false };
@@ -141,7 +143,7 @@ static void push_btn_events(struct piuio *p)
 		}
 }
 
-/* ─── polling work – matrix + coins every 100 ms ───────────────── */
+/* ─── polling work ─────────────────────────────────────────────── */
 static DEFINE_RATELIMIT_STATE(rl, HZ, 10);
 
 static void poll_work(struct work_struct *w)
@@ -149,14 +151,12 @@ static void poll_work(struct work_struct *w)
 	if (!ctx || atomic_read(&ctx->stop))
 		return;
 
-	/* 1. buttons ------------------------------------------------ */
 	if (!get_matrix(ctx)) {
 		if (__ratelimit(&rl))
 			pr_debug("%*phN\n", RPT_LEN_BTN, ctx->btn_buf);
 		push_btn_events(ctx);
 	}
 
-	/* 2. coins -------------------------------------------------- */
 	static ktime_t last;
 	ktime_t now = ktime_get();
 
@@ -204,19 +204,19 @@ static int probe(struct hid_device *hdev, const struct hid_device_id *id)
 	    (r = hid_hw_start(hdev, HID_CONNECT_HIDRAW)))
 		return r;
 
-	/* BIOS does these two immediately after reset ---------------- */
+	/* BIOS sequence ------------------------------------------------ */
 	usb_control_msg(p->udev, usb_sndctrlpipe(p->udev, 0),
 			HID_REQ_SET_IDLE,
 			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
 			0, p->iface, NULL, 0, 10);
-	send_wake(p);                    /* first wake (may be ignored) */
+	send_wake(p);                 /* first attempt (some boards ignore) */
 
-	/* input device ------------------------------------------------ */
+	/* input device ------------------------------------------------- */
 	p->idev = devm_input_allocate_device(&hdev->dev);
 	if (!p->idev) { r = -ENOMEM; goto err_hw; }
 
-	p->idev->name      = "PIUIO Gamepad + Coin";
-	p->idev->phys      = "piuio/input0";
+	p->idev->name       = "PIUIO Gamepad + Coin";
+	p->idev->phys       = "piuio/input0";
 	p->idev->id.bustype = BUS_USB;
 	p->idev->id.vendor  = VID_PIUIO;
 	p->idev->id.product = PID_PIUIO1020;
@@ -230,12 +230,12 @@ static int probe(struct hid_device *hdev, const struct hid_device_id *id)
 	if ((r = input_register_device(p->idev)))
 		goto err_hw;
 
-	/* baseline coin byte & second wake (always works) ------------ */
+	/* baseline coin byte + guaranteed wake ------------------------ */
 	if (read_coin_hi(p, &p->coin_last))
 		p->coin_last = 0;
-	send_wake(p);
+	send_wake(p);                 /* this one always sticks */
 
-	/* start polling ---------------------------------------------- */
+	/* start polling ----------------------------------------------- */
 	ctx = p;
 	INIT_WORK(&p->poll_wq, poll_work);
 	hrtimer_init(&p->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -274,13 +274,13 @@ static const struct hid_device_id ids[] = {
 MODULE_DEVICE_TABLE(hid, ids);
 
 static struct hid_driver drv = {
-	.name   = "piuio",
-	.id_table = ids,
-	.probe  = probe,
-	.remove = remove,
+	.name    = "piuio",
+	.id_table= ids,
+	.probe   = probe,
+	.remove  = remove,
 };
 module_hid_driver(drv);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Diego Acevedo");
-MODULE_DESCRIPTION("PIUIO 0x1020 – 10-button game-pad + coin (byte-15 change, full feature-read)");
+MODULE_DESCRIPTION("PIUIO 0x1020 – 10-button game-pad + coin (byte-15 pulse, reliable wake)");
