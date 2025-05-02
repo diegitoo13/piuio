@@ -404,7 +404,11 @@ static int probe(struct hid_device *hdev, const struct hid_device_id *id)
 	// Configure the input device properties
 	p->idev->name = "PIUIO Gamepad + Coin";
 	p->idev->phys = "piuio/input0"; // Physical path
-	usb_to_input_id(p->udev, &p->idev->id); // Use USB VID/PID for input ID
+	// *** FIX: Revert to original manual ID setting ***
+	p->idev->id.bustype = BUS_USB;
+	p->idev->id.vendor  = VID_PIUIO;
+	p->idev->id.product = PID_PIUIO1020;
+	// *** End of FIX ***
 	p->idev->dev.parent = &hdev->dev; // Set parent device
 
 	// Announce supported event types and keys/buttons
@@ -563,4 +567,4 @@ module_hid_driver(drv);
 // Module metadata
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Diego Acevedo");
-MODULE_DESCRIPTION("PIUIO 0x1020 - Gamepad + Coin (debug logging enabled)");
+MODULE_DESCRIPTION("PIUIO 0x1020 - Gamepad + Coin (debug logging enabled, compile fix)");
