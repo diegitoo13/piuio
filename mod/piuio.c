@@ -181,7 +181,7 @@ static void remove(struct hid_device *hdev) { /* ... same as before ... */
 /* --- boiler-plate --- */
 static const struct hid_device_id ids[] = { { HID_USB_DEVICE(VID_PIUIO, PID_PIUIO1020) }, {} };
 MODULE_DEVICE_TABLE(hid, ids);
-static struct hid_driver drv = { .name="piuio_gp", .id_table=ids, .probe=probe, .remove=remove, };
+static struct hid_driver drv = { .name="piuio", .id_table=ids, .probe=probe, .remove=remove, };
 module_hid_driver(drv);
 MODULE_LICENSE("GPL v2"); MODULE_AUTHOR("Diego Acevedo"); MODULE_DESCRIPTION("PIUIO 0x1020 - Gamepad+Coin (Debug, Init fix 2, Indent fix)");
 
