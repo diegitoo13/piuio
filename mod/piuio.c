@@ -332,7 +332,7 @@ static const struct hid_device_id ids[] = {
 MODULE_DEVICE_TABLE(hid, ids);
 
 static struct hid_driver drv = {
-	.name     = "piuio_gp",
+	.name     = "piuio",
 	.id_table = ids,
 	.probe    = probe,
 	.remove   = remove,
