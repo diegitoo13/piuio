@@ -1,32 +1,37 @@
-# Module object name (e.g., piuio_hid.o if your C file is piuio_hid.c)
-obj-m         := piuio.o
+# Makefile — build & install the piuio.ko kernel module
+# Usage:
+#   make            → build the module
+#   sudo make install   → install to /lib/modules/$(uname -r)/updates
+#   sudo make uninstall → remove the installed module
 
-# Kernel version/directories (allow overrides via command line)
-KVER          ?= $(shell uname -r)
-KDIR          ?= /lib/modules/$(KVER)/build
-PWD           := $(shell pwd)
+# ── module name ────────────────────────────────────────────────
+obj-m := piuio.o            # piuio.c → piuio.ko
 
-# Subdirectory within /lib/modules/$(KVER)/ for installation (e.g., "updates", "extra")
+# ── kernel build directory (override with KDIR=…) ─────────────
+KVER ?= $(shell uname -r)
+KDIR ?= /lib/modules/$(KVER)/build
+PWD  := $(shell pwd)
+
+# ── install sub-dir under /lib/modules/$(KVER)/ ───────────────
 INSTALL_MOD_DIR ?= updates
 export INSTALL_MOD_DIR
 
-# Phony targets
-.PHONY: all modules clean install uninstall modules_install
+# ── phony targets ──────────────────────────────────────────────
+.PHONY: all modules clean install uninstall
 
-# Default target
+# default
 all: modules
 
-# Delegate build, clean, and Kbuild's install to the kernel build system
-modules clean modules_install: %:
-	# --- TAB --- below! Ensure Tab indentation!
+# build / clean via the kernel build system
+modules clean: %:
 	$(MAKE) -C "$(KDIR)" M="$(PWD)" $@
 
-# Use Kbuild's 'modules_install' for the install step
-install: modules_install
+# install via kernel ‘modules_install’
+install: modules
+	$(MAKE) -C "$(KDIR)" M="$(PWD)" modules_install
+	@sudo depmod -a
 
-# Uninstall requires manual removal
+# remove installed module
 uninstall:
-	# --- TAB --- below! Ensure Tab indentation!
-	sudo rm -f "/lib/modules/$(KVER)/$(INSTALL_MOD_DIR)/$(obj-m:.o=.ko)"
-	# --- TAB --- below! Ensure Tab indentation!
-	sudo depmod -a
+	@sudo rm -f "/lib/modules/$(KVER)/$(INSTALL_MOD_DIR)/$(obj-m:.o=.ko)"
+	@sudo depmod -a
