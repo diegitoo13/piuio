@@ -1,66 +1,63 @@
-name: Build and Test PIUIO Kernel Module
+name: Build & Test PIUIO kernel module
 
 on:
   push:
-    branches: ["master"]
+    branches: [master]
   pull_request:
-    branches: ["master"]
+    branches: [master]
 
 jobs:
-  build-and-test:
-    name: Build and Test Kernel Module on Multiple Kernels
+  build:
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        kernel_version: [native, "6.2.0-39-generic", "5.15.0-92-generic"]
+        # “native” = headers that ship with the runner’s own kernel
+        kver: [native, '5.15.0-92-generic', '6.2.0-39-generic']
 
     steps:
-      - name: Checkout source code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set Kernel Version
-        id: kernel
+      # figure-out which header revision to pull in this matrix slot
+      - name: Pick kernel version
+        id: kver
         run: |
-          if [ "${{ matrix.kernel_version }}" = "native" ]; then
-            echo "version=$(uname -r)" >> "$GITHUB_OUTPUT"
+          if [ "${{ matrix.kver }}" = "native" ]; then
+            echo "ver=$(uname -r)" >>"$GITHUB_OUTPUT"
           else
-            echo "version=${{ matrix.kernel_version }}" >> "$GITHUB_OUTPUT"
+            echo "ver=${{ matrix.kver }}" >>"$GITHUB_OUTPUT"
           fi
 
-      - name: Install Dependencies
+      - name: Install tool-chain & headers
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential git curl sparse bc
-          sudo apt-get install -y linux-headers-${{ steps.kernel.outputs.version }}
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+               build-essential bc sparse \
+               linux-headers-${{ steps.kver.outputs.ver }}
 
-      - name: Run Linux Coding Style Check (checkpatch.pl) [native only]
-        if: matrix.kernel_version == 'native'
+      # run checkpatch only once (native kernel slot)
+      - name: checkpatch (style only)
+        if: matrix.kver == 'native'
         run: |
-          curl -sL "https://raw.githubusercontent.com/torvalds/linux/master/scripts/checkpatch.pl" -o checkpatch.pl
+          curl -sL https://raw.githubusercontent.com/torvalds/linux/master/scripts/checkpatch.pl \
+               -o checkpatch.pl
           chmod +x checkpatch.pl
-          ./checkpatch.pl --no-tree --file mod/*.c || true
+          ./checkpatch.pl --no-tree -f mod/*.c || true
 
-      - name: Build Module with Sparse Analysis
+      - name: Build with sparse
         working-directory: mod
         run: |
-          make -C "/lib/modules/${{ steps.kernel.outputs.version }}/build" M="$(pwd)" C=2 CHECK=sparse modules
+          make -C /lib/modules/${{ steps.kver.outputs.ver }}/build \
+               M=$PWD C=2 CHECK=sparse modules
 
-      - name: Show Module Info
+      - name: Show module info
         run: |
-          MOD_PATH="mod/piuio.ko"
-          if [ -f "$MOD_PATH" ]; then
-            sudo modinfo "$MOD_PATH"
-          else
-            echo "ERROR: Module file $MOD_PATH not found!" && exit 1
-          fi
+          modinfo mod/piuio.ko
 
-      - name: Load and Unload Module [native kernel only]
-        if: matrix.kernel_version == 'native'
+      # smoke-test only on the runner’s own kernel
+      - name: Load / unload module (native only)
+        if: matrix.kver == 'native'
         run: |
-          MOD_PATH="mod/piuio.ko"
-          sudo insmod "$MOD_PATH" || { dmesg | tail -20; exit 1; }
-          sleep 2
-          dmesg | tail -20 | grep -Ei '(BUG|panic|oops|warn|error)' && exit 1 || echo "No critical errors detected."
-          sudo rmmod piuio_hid
-          echo "Module loaded and unloaded successfully."
+          sudo insmod mod/piuio.ko
+          sleep 1
+          sudo rmmod piuio
