@@ -93,4 +93,4 @@ sudo modprobe piuio_hid poll_ms=8
 USB traces, LED packet analysis and clean‑ups are welcome.  
 Licensed under **GPL‑2.0**, same as the Linux kernel.
 
-*Author: Diego Acevedo — 2025*
+*Author: Diego Acevedo - 2025*
