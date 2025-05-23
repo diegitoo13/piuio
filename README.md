@@ -3,7 +3,7 @@
 
 Small out‑of‑tree **kernel module** that turns the **Andamiro PIUIO USB I/O board (product 0x1020)** into a standard Linux game‑pad and exposes its coin counter.
 
-LED / lamp output is not implemented yet – this driver is **input‑only**.
+LED / lamp output is not implemented yet, for now this driver is **input‑only**.
 
 ---
 
