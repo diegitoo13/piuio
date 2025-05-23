@@ -35,8 +35,8 @@ These key codes can be remapped later with `udev hwdb` or userspace tools.
 
 ```bash
 # 1. Get the source
-git clone https://github.com/your-name/piuio-1020-hid.git
-cd piuio-1020-hid/mod        # contains Makefile + piuio_hid.c
+git clone https://github.com/diegitoo13/piuio.git
+cd piuio/mod        # contains Makefile + piuio_hid.c
 
 # 2. Build
 make                          # produces piuio_hid.ko
