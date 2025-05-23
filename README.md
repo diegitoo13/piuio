@@ -30,7 +30,7 @@ Key codes can be remapped later with `udev hwdb` or userspace tools.
 
 ---
 
-## Quick install (copy‑paste)
+## Quick install
 
 ```bash
 # get source
